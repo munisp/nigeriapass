@@ -3,7 +3,8 @@ import { Link, useLocation } from "wouter";
 import {
   User, Car, Building2, Monitor, ShieldCheck,
   ChevronRight, Menu, X, LogOut, Bell, CheckCircle2,
-  FileText, Settings, RefreshCw, BarChart3, Users, Wifi, Package, ScanLine, Radio, History, Phone
+  FileText, Settings, RefreshCw, BarChart3, Users, Wifi, Package, ScanLine, Radio, History, Phone,
+  Tag, CreditCard, TrafficCone
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/_core/hooks/useAuth";
@@ -27,6 +28,9 @@ const NAV_ITEMS = [
       { label: "Analytics", icon: BarChart3, href: "/portal/analytics", accent: "indigo", description: "Platform metrics & insights" },
       { label: "User Management", icon: Users, href: "/portal/users", accent: "rose", description: "Admin user management" },
       { label: "Firmware Broadcast", icon: Radio, href: "/portal/firmware-broadcast", accent: "fuchsia", description: "Batch firmware updates" },
+      { label: "eTags/RFID", icon: Tag, href: "/portal/etag", accent: "cyan", description: "Tag issuance & lifecycle" },
+      { label: "POS Terminals", icon: CreditCard, href: "/portal/pos", accent: "orange", description: "Terminal registry & txns" },
+      { label: "Lane Monitor", icon: TrafficCone, href: "/portal/lanes", accent: "sky", description: "Live lane charge events" },
     ]
   },
   {

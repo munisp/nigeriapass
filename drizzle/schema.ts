@@ -1,5 +1,5 @@
 import {
-  pgTable, pgEnum, serial, text, varchar, integer, bigint,
+  pgTable, pgEnum, serial, text, varchar, integer, bigint, real,
   boolean, jsonb, timestamp, index, unique,
 } from "drizzle-orm/pg-core";
 
@@ -682,3 +682,187 @@ export const agents = pgTable("agents", {
 ]);
 export type Agent = typeof agents.$inferSelect;
 export type InsertAgent = typeof agents.$inferInsert;
+
+// ── eTag / RFID Tags ──────────────────────────────────────────────────────────
+/**
+ * Registered RFID windshield tags, eTags and NFC cards used for lane tolling.
+ * tagEpc is the EPC-96 identifier (24 uppercase hex chars) burned into the tag.
+ * A tag is linked to a wallet (wallet_accounts.id) which is debited atomically
+ * when a lane reader reports a crossing (see server/routers/lanes.ts).
+ */
+export const tagTypeEnum = pgEnum("tag_type", ["rfid_windshield", "etag", "nfc_card"]);
+export const tagStatusEnum = pgEnum("tag_status", [
+  "issued",
+  "active",
+  "suspended",
+  "lost",
+  "replaced",
+  "decommissioned",
+]);
+
+export const rfidTags = pgTable("rfid_tags", {
+  id: serial("id").primaryKey(),
+  /** EPC-96 hex identifier, uppercase, unique per physical tag */
+  tagEpc: text("tagEpc").notNull().unique(),
+  tagType: tagTypeEnum("tagType").notNull(),
+  /** Vehicle registration plate the tag is bound to (nullable until bound) */
+  vehiclePlate: text("vehiclePlate"),
+  /** KYC application that vetted the tag holder (kyc_applications.id) */
+  kycApplicationId: integer("kycApplicationId"),
+  /** Wallet debited on lane crossings (wallet_accounts.id) */
+  walletId: integer("walletId"),
+  status: tagStatusEnum("status").notNull().default("issued"),
+  /** Operator user who issued the tag (users.id) */
+  issuedBy: integer("issuedBy"),
+  issuedAt: timestamp("issuedAt").defaultNow().notNull(),
+  activatedAt: timestamp("activatedAt"),
+  /** When replaced, points at the successor rfid_tags.id */
+  replacedByTagId: integer("replacedByTagId"),
+  /** Free-form metadata (plaza of issuance, vehicle class, exemptions, ...) */
+  meta: jsonb("meta").$type<Record<string, unknown>>(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+}, (table) => [
+  index("idx_rfid_tags_vehiclePlate").on(table.vehiclePlate),
+  index("idx_rfid_tags_walletId").on(table.walletId),
+  index("idx_rfid_tags_status").on(table.status),
+]);
+
+export type RfidTag = typeof rfidTags.$inferSelect;
+export type InsertRfidTag = typeof rfidTags.$inferInsert;
+
+// ── Lane Events ───────────────────────────────────────────────────────────────
+/**
+ * Immutable record of every tag read reported by a lane controller.
+ * eventUid is the reader-generated UUID idempotency key — replays (offline
+ * store-and-forward syncs, retries) never double-charge.
+ */
+export const laneDirectionEnum = pgEnum("lane_direction", ["entry", "exit"]);
+export const chargeStatusEnum = pgEnum("charge_status", [
+  "charged",
+  "insufficient",
+  "free",
+  "exempt",
+  "queued",
+  "failed",
+]);
+
+export const laneEvents = pgTable("lane_events", {
+  id: serial("id").primaryKey(),
+  /** Reader-generated UUID — unique idempotency key */
+  eventUid: text("eventUid").notNull().unique(),
+  plazaId: text("plazaId").notNull(),
+  laneId: text("laneId").notNull(),
+  /** Reader identifier (used for lane HMAC token derivation) */
+  readerId: text("readerId"),
+  /** FK to toll_devices.id when the reader is a registered device */
+  deviceId: integer("deviceId"),
+  tagEpc: text("tagEpc").notNull(),
+  walletId: integer("walletId"),
+  direction: laneDirectionEnum("direction").notNull().default("exit"),
+  /** Amount that was (or would have been) charged, in kobo */
+  amountKobo: integer("amountKobo").notNull(),
+  chargeStatus: chargeStatusEnum("chargeStatus").notNull(),
+  /** wallet_transactions.id when chargeStatus = 'charged' */
+  walletTxnId: integer("walletTxnId"),
+  /** Fraud probability (0-1) from the ML scoring bridge at ingest time */
+  fraudScore: real("fraudScore"),
+  /** True when the same tag was read at the same plaza within 5 minutes */
+  antiPassbackBlocked: boolean("antiPassbackBlocked").default(false).notNull(),
+  /** When the crossing physically happened (reader clock) */
+  occurredAt: timestamp("occurredAt").notNull(),
+  /** When the server ingested the event */
+  receivedAt: timestamp("receivedAt").defaultNow().notNull(),
+  /** Raw payload as received from the lane controller */
+  rawPayload: jsonb("rawPayload").$type<Record<string, unknown>>(),
+}, (table) => [
+  index("idx_lane_events_plaza_occurred").on(table.plazaId, table.occurredAt),
+  index("idx_lane_events_tag_occurred").on(table.tagEpc, table.occurredAt),
+  index("idx_lane_events_chargeStatus").on(table.chargeStatus),
+]);
+
+export type LaneEvent = typeof laneEvents.$inferSelect;
+export type InsertLaneEvent = typeof laneEvents.$inferInsert;
+
+// ── POS Terminals ─────────────────────────────────────────────────────────────
+/**
+ * Registered point-of-sale terminals at toll plazas (Paystack, Flutterwave,
+ * Interswitch, Moniepoint hardware). Populated by the pos router.
+ */
+export const posVendorEnum = pgEnum("pos_vendor", [
+  "paystack",
+  "flutterwave",
+  "interswitch",
+  "moniepoint",
+]);
+export const terminalStatusEnum = pgEnum("terminal_status", [
+  "active",
+  "inactive",
+  "maintenance",
+  "revoked",
+]);
+
+export const posTerminals = pgTable("pos_terminals", {
+  id: serial("id").primaryKey(),
+  /** Vendor-assigned terminal identifier — unique */
+  terminalId: text("terminalId").notNull().unique(),
+  plazaId: text("plazaId").notNull(),
+  vendor: posVendorEnum("vendor").notNull(),
+  serialNumber: text("serialNumber"),
+  status: terminalStatusEnum("status").notNull().default("active"),
+  /** Operator user who registered the terminal (users.id) */
+  registeredBy: integer("registeredBy"),
+  lastSeenAt: timestamp("lastSeenAt"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, (table) => [
+  index("idx_pos_terminals_plazaId").on(table.plazaId),
+  index("idx_pos_terminals_status").on(table.status),
+]);
+
+export type PosTerminal = typeof posTerminals.$inferSelect;
+export type InsertPosTerminal = typeof posTerminals.$inferInsert;
+
+// ── POS Transactions ──────────────────────────────────────────────────────────
+/**
+ * Card transactions performed on POS terminals — toll payments and wallet
+ * top-ups. txnUid is the idempotency key; offline terminals queue transactions
+ * (status 'queued_offline') and sync them when connectivity returns.
+ */
+export const posTxnTypeEnum = pgEnum("pos_txn_type", ["toll_payment", "wallet_topup"]);
+export const posTxnStatusEnum = pgEnum("pos_txn_status", [
+  "pending",
+  "approved",
+  "declined",
+  "reversed",
+  "queued_offline",
+]);
+
+export const posTransactions = pgTable("pos_transactions", {
+  id: serial("id").primaryKey(),
+  /** Terminal-generated UUID — unique idempotency key */
+  txnUid: text("txnUid").notNull().unique(),
+  /** FK to pos_terminals.id */
+  terminalId: integer("terminalId").notNull(),
+  type: posTxnTypeEnum("type").notNull(),
+  amountKobo: integer("amountKobo").notNull(),
+  cardLast4: text("cardLast4"),
+  cardScheme: text("cardScheme"),
+  /** Retrieval reference number from the card network */
+  rrn: text("rrn"),
+  /** System trace audit number */
+  stan: text("stan"),
+  status: posTxnStatusEnum("status").notNull().default("pending"),
+  /** Wallet credited/debited (wallet_accounts.id) when linked */
+  walletId: integer("walletId"),
+  /** lane_events.id when this transaction settled a lane crossing */
+  laneEventId: integer("laneEventId"),
+  occurredAt: timestamp("occurredAt").notNull(),
+  syncedAt: timestamp("syncedAt").defaultNow().notNull(),
+}, (table) => [
+  index("idx_pos_txn_terminal_occurred").on(table.terminalId, table.occurredAt),
+  index("idx_pos_txn_walletId").on(table.walletId),
+  index("idx_pos_txn_status").on(table.status),
+]);
+
+export type PosTransaction = typeof posTransactions.$inferSelect;
+export type InsertPosTransaction = typeof posTransactions.$inferInsert;

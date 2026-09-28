@@ -74,6 +74,15 @@ const QrScanHistory = lazy(() => import("./pages/QrScanHistory"));
 // USSD Sessions — admin session list with replay
 const UssdSessions = lazy(() => import("./pages/UssdSessions"));
 
+// eTag / RFID Management
+const ETagManagement = lazy(() => import("./pages/ETagManagement"));
+
+// POS Terminals — registry, transactions and daily settlement
+const PosTerminals = lazy(() => import("./pages/PosTerminals"));
+
+// Lane Monitor — live toll lane event feed
+const LaneMonitor = lazy(() => import("./pages/LaneMonitor"));
+
 // Legal pages
 const PrivacyPolicy = lazy(() => import("./pages/PrivacyPolicy"));
 const TermsOfService = lazy(() => import("./pages/TermsOfService"));
@@ -210,6 +219,21 @@ function Router() {
           {/* ── USSD Sessions ── */}
           <Route path="/portal/ussd-sessions">
             {() => <ProtectedRoute component={UssdSessions} requiredRole="admin" />}
+          </Route>
+
+          {/* ── eTag / RFID Management ── */}
+          <Route path="/portal/etag">
+            {() => <ProtectedRoute component={ETagManagement} />}
+          </Route>
+
+          {/* ── POS Terminals ── */}
+          <Route path="/portal/pos">
+            {() => <ProtectedRoute component={PosTerminals} />}
+          </Route>
+
+          {/* ── Lane Monitor ── */}
+          <Route path="/portal/lanes">
+            {() => <ProtectedRoute component={LaneMonitor} />}
           </Route>
 
           {/* ── Legal pages (public) ── */}

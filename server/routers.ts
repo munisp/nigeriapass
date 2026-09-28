@@ -15,6 +15,9 @@ import { nfcRouter } from "./routers/nfc";
 import { nfcBatchRouter } from "./routers/nfcBatch";
 import { devicesRouter } from "./routers/devices";
 import { dataRightsRouter } from "./routers/dataRights";
+import { etagRouter } from "./routers/etag";
+import { lanesRouter } from "./routers/lanes";
+import { posRouter } from "./routers/pos";
 
 export const appRouter = router({
     // if you need to use socket.io, read and register route in server/_core/index.ts, all api should start with '/api/' so that the gateway can route correctly
@@ -72,6 +75,12 @@ export const appRouter = router({
   devices: devicesRouter,
   // NDPR data rights — export, erasure, consent management
   dataRights: dataRightsRouter,
+  // eTag/RFID tag lifecycle — issue, activate, suspend, replace, wallet linking
+  etag: etagRouter,
+  // RFID lane middleware — lane-controller ingest, charging pipeline, plaza ops
+  lanes: lanesRouter,
+  // Card-POS middleware — terminal management, card-txn ingest, offline sync, reversals
+  pos: posRouter,
 });
 
 export type AppRouter = typeof appRouter;
