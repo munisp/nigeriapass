@@ -24,7 +24,7 @@ import { Router, Request, Response } from "express";
 import crypto from "crypto";
 import { ENV } from "../_core/env.js";
 import { processUssdInput } from "../routers/ussd.js";
-import { getDb } from "../db.js";
+import { getDb, getUserByPhone } from "../db.js";
 
 /** Fire-and-forget: update ussd_sessions row after each response */
 async function persistUssdResponse(
@@ -94,7 +94,11 @@ function verifyAtSignature(req: Request, res: Response, next: () => void) {
 }
 
 // ── Raw body capture for HMAC verification ────────────────────────────────────
+// server/_core/index.ts mounts express.urlencoded({ verify }) for /api/ussd
+// BEFORE the global body parser, so req.rawBody is normally already present.
+// This fallback only runs when the router is used standalone (tests).
 ussdWebhookRouter.use((req, _res, next) => {
+  if ((req as Request & { rawBody?: Buffer }).rawBody) return next();
   const chunks: Buffer[] = [];
   req.on("data", (chunk: Buffer) => chunks.push(chunk));
   req.on("end", () => {
@@ -128,11 +132,19 @@ ussdWebhookRouter.post(
       const maskedPhone = phoneNumber.replace(/(\+\d{3})\d+(\d{3})/, "$1****$2");
       console.log(`[USSD] Session ${sessionId} | Phone ${maskedPhone} | Code ${serviceCode} | Text "${text}"`);
 
-      // Process through the state machine
+      // Resolve the user by phone (openId convention "phone:<msisdn>") so
+      // balance/statement flows operate on the correct wallet (audit v13, P0-10).
       if (!sessionStartTimes.has(sessionId)) {
         sessionStartTimes.set(sessionId, Date.now());
       }
-      const response = await processUssdInput(sessionId, phoneNumber, text, undefined, serviceCode);
+      let linkedUserId: string | undefined;
+      try {
+        const user = await getUserByPhone(phoneNumber);
+        if (user) linkedUserId = String(user.id);
+      } catch {
+        // Non-fatal — unlinked phones still get the public menus
+      }
+      const response = await processUssdInput(sessionId, phoneNumber, text, linkedUserId, serviceCode);
 
       // Persist session state asynchronously (fire-and-forget)
       const startedAt = sessionStartTimes.get(sessionId) ?? Date.now();

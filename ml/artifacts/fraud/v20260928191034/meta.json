@@ -1,0 +1,44 @@
+{
+  "model": "fraud",
+  "version": "v20260928191034",
+  "created_at": "2026-09-28T11:10:34Z",
+  "metrics": {
+    "auc": 0.9956093876878872,
+    "pr_auc": 0.8880355261489601,
+    "f1": 0.5113562621674238,
+    "confusion": {
+      "tn": 72598,
+      "fp": 2217,
+      "fn": 42,
+      "tp": 1182
+    },
+    "base_rate": 0.016097002853798708,
+    "val_auc": 0.9970407920219866,
+    "train_seconds": 13.6
+  },
+  "params": {
+    "hidden": 64,
+    "epochs": 12,
+    "lr": 0.001,
+    "batch": 4096,
+    "seed": 42,
+    "n_train": 354846
+  },
+  "features": [
+    "amount_log",
+    "amount_z",
+    "tx_count_1h",
+    "tx_count_24h",
+    "device_degree",
+    "ip_degree",
+    "kyc_age_days",
+    "kyc_tier",
+    "hour_sin",
+    "hour_cos",
+    "is_night",
+    "days_since_signup",
+    "is_transfer",
+    "is_topup"
+  ],
+  "onnx_exported": true
+}

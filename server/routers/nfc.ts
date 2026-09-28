@@ -2,28 +2,45 @@
  * NFC Tag Provisioning Router
  * ===========================
  * Server-side AES-128 key derivation via HKDF using the NFC_MASTER_SECRET
- * environment variable. The client never sees the master secret — only the
- * derived per-tag key is returned.
+ * environment variable. The client never sees the master secret.
  *
- * In production, NFC_MASTER_SECRET should be a 256-bit random hex string
- * stored in a KMS/HSM and injected as an environment variable.
+ * Audit v13 hardening:
+ *  - NFC_MASTER_SECRET is REQUIRED — there is no hardcoded fallback (P0-6).
+ *  - All mutations require operator/admin role (P0-6).
+ *  - The full derived key is returned to admins only; operators receive a
+ *    masked prefix (P0-6).
+ *  - Provisioning events are written to nfc_provisioning_events, NOT to
+ *    kyc_applications (P0-7).
  */
 import { z } from "zod";
-import { protectedProcedure, router } from "../_core/trpc";
+import { TRPCError } from "@trpc/server";
+import { operatorProcedure, protectedProcedure, router } from "../_core/trpc";
 import { ENV } from "../_core/env";
-import { getDb, createKycApplication, getKycApplicationsByUserId } from "../db";
-import { kycApplications, type KycApplication, type InsertKycApplication } from "../../drizzle/schema";
+import { getDb } from "../db";
+import { nfcProvisioningEvents } from "../../drizzle/schema";
 import { eq, desc } from "drizzle-orm";
 import * as crypto from "crypto";
+import { audit } from "../_core/audit";
 
 // ── Key derivation ─────────────────────────────────────────────────────────────
+
+/** Fail closed: the master secret must come from the environment. */
+function requireMasterSecret(): string {
+  if (!ENV.nfcMasterSecret) {
+    throw new TRPCError({
+      code: "PRECONDITION_FAILED",
+      message: "NFC_MASTER_SECRET is not configured. NFC provisioning is disabled.",
+    });
+  }
+  return ENV.nfcMasterSecret;
+}
 
 /**
  * Derives a 128-bit AES key from the master secret + tagId using HKDF-SHA256.
  * Returns the key as a 32-character uppercase hex string.
  */
 function deriveTagKeyServer(tagId: string): string {
-  const masterSecret = ENV.nfcMasterSecret || "NigerianPass-Server-Master-Secret-v1";
+  const masterSecret = requireMasterSecret();
   // Use Node.js crypto HKDF
   const ikm = Buffer.from(masterSecret, "utf8");
   const salt = Buffer.from("NigerianPass-NFC-Salt-v1", "utf8");
@@ -47,20 +64,30 @@ function signNdefPayload(tagId: string, vehicleRef: string, keyHex: string): str
   return crypto.createHmac("sha256", keyHex).update(payload).digest("hex").slice(0, 16).toUpperCase();
 }
 
+/** Mask a derived key: first 8 hex chars + ellipsis. */
+function maskKey(keyHex: string): string {
+  return keyHex.slice(0, 8) + "...";
+}
+
 // ── Router ─────────────────────────────────────────────────────────────────────
 
 export const nfcRouter = router({
   /**
    * Provision a new NFC tag: derive the per-tag AES-128 key server-side,
-   * record the provisioning event, and return the key + NDEF payload to the client.
+   * record the provisioning event in nfc_provisioning_events, and return the
+   * key + NDEF payload to the client.
+   *
+   * RBAC: operators may provision, but only admins receive the full derived
+   * key — operators get a masked prefix (P0-6).
    */
-  provision: protectedProcedure
+  provision: operatorProcedure
     .input(z.object({
       tagId: z.string().min(6).max(64).regex(/^[A-Z0-9\-_]+$/, "Tag ID must be alphanumeric"),
       vehicleRef: z.string().min(3).max(64),
     }))
     .mutation(async ({ input, ctx }) => {
       const { tagId, vehicleRef } = input;
+      const isAdmin = ctx.user.role === "admin";
 
       // Derive per-tag key server-side (master secret never leaves the server)
       const keyHex = deriveTagKeyServer(tagId);
@@ -71,36 +98,40 @@ export const nfcRouter = router({
         v: 1,
         tid: tagId,
         vref: vehicleRef,
-        k: keyHex.slice(0, 8) + "...", // truncated — full key written to secure element
+        k: maskKey(keyHex), // truncated — full key written to secure element
         sig: signature,
         ts: Date.now(),
         issuer: "NigerianPass",
         provisionedBy: ctx.user.id,
       });
 
-      // Log the provisioning event in the KYC applications table
-      // (reusing kycApplications as an audit log for NFC provisioning events)
+      // Record the provisioning event in the dedicated audit table (P0-7).
       const refId = `NFC-${tagId.slice(0, 8)}-${Date.now().toString(36).toUpperCase()}`;
-      await createKycApplication({
-        userId: ctx.user.id,
-        type: "driver" as const, // closest available type for audit logging
-        status: "approved",
-        referenceId: refId,
-        formData: {
-          nfcTagId: tagId,
-          vehicleRef,
-          keyHexPrefix: keyHex.slice(0, 8) + "...", // never log full key
-          signature,
-          provisionedAt: new Date().toISOString(),
-          provisionedBy: ctx.user.id,
-          eventType: "nfc_provisioning",
-        },
-      } as InsertKycApplication);
+      const db = await getDb();
+      if (!db) {
+        throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
+      }
+      await db.insert(nfcProvisioningEvents).values({
+        refId,
+        tagId,
+        vehicleRef,
+        keyHexPrefix: maskKey(keyHex), // never store the full key
+        signature,
+        provisionedBy: ctx.user.id,
+      });
+
+      void audit(ctx, "nfc.provision", "nfc_tag", tagId, {
+        refId,
+        vehicleRef,
+        keyHexPrefix: maskKey(keyHex),
+      });
 
       return {
         tagId,
         vehicleRef,
-        keyHex,        // full key — client uses this for Web NFC write
+        // Full key only for admins — operators get the masked prefix (P0-6)
+        keyHex: isAdmin ? keyHex : maskKey(keyHex),
+        keyMasked: !isAdmin,
         ndefPayload,   // NDEF text record content
         signature,
         refId,
@@ -112,7 +143,7 @@ export const nfcRouter = router({
    * Verify a tag read-back: re-derive the key and compare the NDEF payload.
    * Returns whether the tag content matches the expected provisioning data.
    */
-  verify: protectedProcedure
+  verify: operatorProcedure
     .input(z.object({
       tagId: z.string().min(6).max(64),
       ndefContent: z.string(),
@@ -142,20 +173,29 @@ export const nfcRouter = router({
 
   /**
    * Get provisioning history for the current user (last 20 events).
+   * Reads from nfc_provisioning_events (not kyc_applications).
    */
   getHistory: protectedProcedure
     .query(async ({ ctx }) => {
-      const rows = await getKycApplicationsByUserId(ctx.user.id);
+      const db = await getDb();
+      if (!db) return [];
 
-      return rows
-        .filter((r: KycApplication) => {
-          const fd = r.formData as Record<string, unknown>;
-          return fd?.eventType === "nfc_provisioning";
-        })
-        .map((r: KycApplication) => ({
-          refId: r.referenceId,
-          formData: r.formData as Record<string, unknown>,
-          provisionedAt: r.createdAt,
-        }));
+      const isAdmin = ctx.user.role === "admin";
+      const rows = await db
+        .select()
+        .from(nfcProvisioningEvents)
+        .where(isAdmin ? undefined : eq(nfcProvisioningEvents.provisionedBy, ctx.user.id))
+        .orderBy(desc(nfcProvisioningEvents.createdAt))
+        .limit(20);
+
+      return rows.map(r => ({
+        refId: r.refId,
+        tagId: r.tagId,
+        vehicleRef: r.vehicleRef,
+        keyHexPrefix: r.keyHexPrefix,
+        signature: r.signature,
+        provisionedBy: r.provisionedBy,
+        provisionedAt: r.createdAt,
+      }));
     }),
 });

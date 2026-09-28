@@ -19,6 +19,8 @@ import {
   walletTransactions,
   reconciliationRuns,
   nfcBatchJobs,
+  kycStatusHistory,
+  sessions,
 } from "../drizzle/schema";
 import { ENV } from './_core/env';
 
@@ -26,20 +28,49 @@ let _db: ReturnType<typeof drizzle> | null = null;
 let _pool: Pool | null = null;
 
 // Lazily create the drizzle instance so local tooling can run without a DB.
+// In production this FAILS FAST (throws) instead of returning null so that
+// money-moving code paths can never silently degrade.
 export async function getDb() {
   if (!_db) {
     const url = process.env.POSTGRES_URL ?? process.env.DATABASE_URL ?? "";
     if (!url || (!url.startsWith("postgres") && !url.startsWith("postgresql"))) {
-      console.warn("[Database] No valid PostgreSQL URL found in POSTGRES_URL or DATABASE_URL");
+      const msg = "[Database] No valid PostgreSQL URL found in POSTGRES_URL or DATABASE_URL";
+      if (ENV.isProduction) throw new Error(msg);
+      console.warn(msg);
       return null;
     }
     try {
-      _pool = new Pool({ connectionString: url, ssl: url.includes("sslmode=require") ? { rejectUnauthorized: false } : false });
+      // TLS: when a CA certificate is provided, verify the server identity.
+      // sslmode=require without a CA uses an encrypted-but-unverified channel
+      // only outside production.
+      const ca = process.env.DATABASE_CA_CERT ?? process.env.PGSSLROOTCERT;
+      const wantsSsl = url.includes("sslmode=require") || url.includes("ssl=true") || !!ca;
+      const ssl = wantsSsl
+        ? ca
+          ? { rejectUnauthorized: true, ca }
+          : ENV.isProduction
+            ? { rejectUnauthorized: true }
+            : { rejectUnauthorized: false }
+        : false;
+
+      _pool = new Pool({
+        connectionString: url,
+        ssl,
+        max: parseInt(process.env.PG_POOL_MAX ?? "10", 10),
+        idleTimeoutMillis: parseInt(process.env.PG_IDLE_TIMEOUT_MS ?? "30000", 10),
+        connectionTimeoutMillis: parseInt(process.env.PG_CONNECTION_TIMEOUT_MS ?? "10000", 10),
+        statement_timeout: parseInt(process.env.PG_STATEMENT_TIMEOUT_MS ?? "15000", 10),
+        allowExitOnIdle: false,
+      });
+      _pool.on("error", (err) => {
+        console.error("[Database] Unexpected idle-client error:", err);
+      });
       _db = drizzle(_pool);
       console.log("[Database] PostgreSQL connection established");
     } catch (error) {
       console.warn("[Database] Failed to connect:", error);
       _db = null;
+      if (ENV.isProduction) throw error;
     }
   }
   return _db;
@@ -130,16 +161,37 @@ export async function updateKycApplicationStatus(
 ) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
+
+  // Read the current row for the status-history trail
+  const [current] = await db
+    .select({ status: kycApplications.status })
+    .from(kycApplications)
+    .where(eq(kycApplications.referenceId, referenceId))
+    .limit(1);
+
+  // Only overwrite review fields that were explicitly provided — previously
+  // omitted fields were wiped to null (audit v13, P1-14).
+  const set: Record<string, unknown> = {
+    status,
+    reviewedAt: new Date(),
+    updatedAt: new Date(),
+  };
+  if (opts?.reviewNotes !== undefined) set.reviewNotes = opts.reviewNotes;
+  if (opts?.reviewedBy !== undefined) set.reviewedBy = opts.reviewedBy;
+  if (opts?.kycScore !== undefined) set.kycScore = opts.kycScore;
+
   await db.update(kycApplications)
-    .set({
-      status,
-      reviewNotes: opts?.reviewNotes ?? null,
-      reviewedBy: opts?.reviewedBy ?? null,
-      kycScore: opts?.kycScore ?? null,
-      reviewedAt: new Date(),
-      updatedAt: new Date(),
-    })
+    .set(set)
     .where(eq(kycApplications.referenceId, referenceId));
+
+  // Append immutable status history
+  await db.insert(kycStatusHistory).values({
+    referenceId,
+    fromStatus: current?.status ?? null,
+    toStatus: status,
+    changedBy: opts?.reviewedBy ?? null,
+    notes: opts?.reviewNotes ?? null,
+  });
 }
 
 type KycApplication = typeof kycApplications.$inferSelect;
@@ -395,4 +447,236 @@ export async function listNfcBatchJobs(limit = 20): Promise<NfcBatchJob[]> {
   return db.select().from(nfcBatchJobs)
     .orderBy(desc(nfcBatchJobs.createdAt))
     .limit(limit);
+}
+
+// ── Atomic Wallet Operations ──────────────────────────────────────────────────
+// These helpers perform credit/debit inside a single DB transaction with an
+// INSERT ... ON CONFLICT (external_ref) DO NOTHING idempotency guard and an
+// atomic SQL balance update. No read-modify-write balance math in JS.
+
+export type WalletCreditResult =
+  | { status: "credited"; walletId: number; transactionId: number; newBalanceKobo: number }
+  | { status: "duplicate" }
+  | { status: "no_wallet" };
+
+/** Atomically credit a user's wallet. Idempotent on externalRef. */
+export async function creditWalletAtomic(params: {
+  userId: number;
+  amountKobo: number;
+  externalRef: string;
+  type: "topup" | "refund" | "adjustment";
+  description: string;
+}): Promise<WalletCreditResult> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  return db.transaction(async (tx) => {
+    const wallets = await tx
+      .select({ id: walletAccounts.id })
+      .from(walletAccounts)
+      .where(eq(walletAccounts.userId, params.userId))
+      .limit(1);
+    const wallet = wallets[0];
+    if (!wallet) return { status: "no_wallet" } as const;
+
+    // Idempotency guard — external_ref has a UNIQUE constraint; a replayed
+    // webhook/retry inserts zero rows here and we bail out without crediting.
+    const inserted = await tx
+      .insert(walletTransactions)
+      .values({
+        walletId: wallet.id,
+        type: params.type,
+        amountKobo: params.amountKobo,
+        balanceAfterKobo: 0, // patched below after the atomic increment
+        externalRef: params.externalRef,
+        description: params.description,
+      })
+      .onConflictDoNothing({ target: walletTransactions.externalRef })
+      .returning({ id: walletTransactions.id });
+
+    if (inserted.length === 0) return { status: "duplicate" } as const;
+
+    // Atomic increment — no JS read-modify-write of the balance
+    const updated = await tx
+      .update(walletAccounts)
+      .set({
+        balanceKobo: sql`${walletAccounts.balanceKobo} + ${params.amountKobo}`,
+        lastBalanceSync: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(walletAccounts.id, wallet.id))
+      .returning({ balanceKobo: walletAccounts.balanceKobo });
+
+    const newBalance = updated[0]?.balanceKobo ?? 0;
+    await tx
+      .update(walletTransactions)
+      .set({ balanceAfterKobo: newBalance })
+      .where(eq(walletTransactions.id, inserted[0]!.id));
+
+    return {
+      status: "credited",
+      walletId: wallet.id,
+      transactionId: inserted[0]!.id,
+      newBalanceKobo: newBalance,
+    } as const;
+  });
+}
+
+export type WalletDebitResult =
+  | { status: "debited"; walletId: number; transactionId: number; newBalanceKobo: number }
+  | { status: "duplicate" }
+  | { status: "no_wallet" }
+  | { status: "insufficient_funds"; balanceKobo: number }
+  | { status: "daily_cap_exceeded"; dailyCapKobo: number; dailySpentKobo: number };
+
+/**
+ * Atomically debit a user's wallet (toll charges).
+ * Idempotent on externalRef; enforces balance >= 0 and the daily fare cap.
+ */
+export async function debitWalletAtomic(params: {
+  userId: number;
+  amountKobo: number;
+  externalRef: string;
+  description: string;
+  plazaId?: string;
+}): Promise<WalletDebitResult> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  return db.transaction(async (tx) => {
+    const wallets = await tx
+      .select()
+      .from(walletAccounts)
+      .where(eq(walletAccounts.userId, params.userId))
+      .limit(1);
+    const wallet = wallets[0];
+    if (!wallet) return { status: "no_wallet" } as const;
+
+    // Daily cap enforcement (resets handled by wallet.getBalance / nightly job)
+    if (wallet.dailySpentKobo + params.amountKobo > wallet.dailyCapKobo) {
+      return {
+        status: "daily_cap_exceeded",
+        dailyCapKobo: wallet.dailyCapKobo,
+        dailySpentKobo: wallet.dailySpentKobo,
+      } as const;
+    }
+
+    // Idempotency guard
+    const inserted = await tx
+      .insert(walletTransactions)
+      .values({
+        walletId: wallet.id,
+        type: "toll_charge",
+        amountKobo: params.amountKobo,
+        balanceAfterKobo: 0,
+        externalRef: params.externalRef,
+        plazaId: params.plazaId ?? null,
+        description: params.description,
+      })
+      .onConflictDoNothing({ target: walletTransactions.externalRef })
+      .returning({ id: walletTransactions.id });
+
+    if (inserted.length === 0) return { status: "duplicate" } as const;
+
+    // Conditional atomic decrement — the WHERE clause guarantees the balance
+    // can never go negative even under concurrent debits.
+    const updated = await tx
+      .update(walletAccounts)
+      .set({
+        balanceKobo: sql`${walletAccounts.balanceKobo} - ${params.amountKobo}`,
+        dailySpentKobo: sql`${walletAccounts.dailySpentKobo} + ${params.amountKobo}`,
+        lastBalanceSync: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(walletAccounts.id, wallet.id),
+        sql`${walletAccounts.balanceKobo} >= ${params.amountKobo}`,
+      ))
+      .returning({ balanceKobo: walletAccounts.balanceKobo });
+
+    if (updated.length === 0) {
+      // Roll back the transaction row by throwing — the caller sees
+      // insufficient_funds and no ledger entry is committed.
+      const err = new Error("insufficient_funds") as Error & { code?: string };
+      err.code = "insufficient_funds";
+      throw err;
+    }
+
+    const newBalance = updated[0]!.balanceKobo;
+    await tx
+      .update(walletTransactions)
+      .set({ balanceAfterKobo: newBalance })
+      .where(eq(walletTransactions.id, inserted[0]!.id));
+
+    return {
+      status: "debited",
+      walletId: wallet.id,
+      transactionId: inserted[0]!.id,
+      newBalanceKobo: newBalance,
+    } as const;
+  }).catch((err: Error & { code?: string }) => {
+    if (err.code === "insufficient_funds") {
+      return { status: "insufficient_funds", balanceKobo: -1 } as const;
+    }
+    throw err;
+  });
+}
+
+// ── Session Registry (JWT revocation) ─────────────────────────────────────────
+
+export async function createSessionRecord(data: {
+  jti: string;
+  userId: number;
+  expiresAt: Date;
+  ip?: string | null;
+  userAgent?: string | null;
+}) {
+  const db = await getDb();
+  if (!db) return;
+  await db.insert(sessions).values({
+    jti: data.jti,
+    userId: data.userId,
+    expiresAt: data.expiresAt,
+    ip: data.ip ?? null,
+    userAgent: data.userAgent ?? null,
+  }).onConflictDoNothing({ target: sessions.jti });
+}
+
+/** Returns true when the session jti exists and has been revoked. */
+export async function isSessionRevoked(jti: string): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false; // dev without DB — nothing to check against
+  const rows = await db
+    .select({ revokedAt: sessions.revokedAt, expiresAt: sessions.expiresAt })
+    .from(sessions)
+    .where(eq(sessions.jti, jti))
+    .limit(1);
+  const row = rows[0];
+  if (!row) return false;
+  return row.revokedAt !== null;
+}
+
+export async function revokeSession(jti: string) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(sessions)
+    .set({ revokedAt: new Date() })
+    .where(and(eq(sessions.jti, jti), sql`${sessions.revokedAt} IS NULL`));
+}
+
+export async function revokeAllSessionsForUser(userId: number): Promise<number> {
+  const db = await getDb();
+  if (!db) return 0;
+  const updated = await db.update(sessions)
+    .set({ revokedAt: new Date() })
+    .where(and(eq(sessions.userId, userId), sql`${sessions.revokedAt} IS NULL`))
+    .returning({ id: sessions.id });
+  return updated.length;
+}
+
+// ── Users by phone (USSD account linking) ─────────────────────────────────────
+
+/** Resolve a user by E.164 phone number (openId convention: "phone:<msisdn>"). */
+export async function getUserByPhone(msisdn: string) {
+  return getUserByOpenId(`phone:${msisdn}`);
 }

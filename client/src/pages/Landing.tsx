@@ -11,7 +11,7 @@ import {
   Phone, BarChart2, Settings, RefreshCw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { useAuth } from "@/contexts/AuthContext";
+import { useAuth } from "@/_core/hooks/useAuth";
 import NotificationBell from "@/components/NotificationBell";
 import { toast } from "sonner";
 

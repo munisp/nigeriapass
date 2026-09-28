@@ -20,10 +20,23 @@ import { ENV } from "../_core/env.js";
 
 // ── Africa's Talking client (lazy-initialised) ────────────────────────────────
 
-const AT_API_KEY = ENV.atApiKey;
+// Evaluated at call time so tests can stub env and production never gets a
+// stale module-load snapshot.
+function atApiKey(): string {
+  return ENV.atApiKey;
+}
 const AT_USERNAME = ENV.atUsername || "sandbox";
 const AT_SENDER_ID = ENV.atSenderId || "NigerianPass";
-const DEMO_MODE = !AT_API_KEY || AT_API_KEY === "demo";
+
+/**
+ * Demo mode is ONLY permitted outside production. In production a missing
+ * AT_API_KEY must fail closed — never accept a fixed code for any phone.
+ */
+function isDemoMode(): boolean {
+  if (ENV.isProduction) return false;
+  const key = atApiKey();
+  return !key || key === "demo";
+}
 
 interface AtSmsResponse {
   SMSMessageData: {
@@ -39,9 +52,15 @@ interface AtSmsResponse {
 }
 
 async function sendViaSmsApi(phone: string, code: string): Promise<string | null> {
-  if (DEMO_MODE) {
-    console.log(`[OTP] DEMO MODE — code for ${phone}: ${code}`);
+  if (isDemoMode()) {
+    console.log(`[OTP] DEMO MODE (non-production) — code for ${phone}: ${code}`);
     return "demo-message-id";
+  }
+
+  const apiKey = atApiKey();
+  if (!apiKey) {
+    // Fail closed in production: no SMS provider configured.
+    throw new Error("SMS provider not configured (AT_API_KEY missing)");
   }
 
   const body = new URLSearchParams({
@@ -61,7 +80,7 @@ async function sendViaSmsApi(phone: string, code: string): Promise<string | null
     headers: {
       Accept: "application/json",
       "Content-Type": "application/x-www-form-urlencoded",
-      apiKey: AT_API_KEY,
+      apiKey,
     },
     body: body.toString(),
   });
@@ -145,7 +164,8 @@ export async function sendOtp(
   return {
     success: true,
     maskedPhone: masked,
-    demoCode: DEMO_MODE ? code : undefined,
+    // Never return the code in production — demoCode is dev/test only.
+    demoCode: isDemoMode() ? code : undefined,
     expiresInSeconds: 120,
   };
 }
@@ -169,15 +189,17 @@ export async function verifyOtp(
 ): Promise<VerifyOtpResult> {
   const db = await getDb();
 
-  // Demo mode: accept 123456 without DB lookup
-  if (DEMO_MODE && submittedCode === "123456") {
+  // Demo mode (development/test ONLY): accept the fixed code without a DB
+  // lookup. In production isDemoMode() is always false, so this branch is
+  // unreachable there — verification always hits the hashed DB record.
+  if (isDemoMode() && submittedCode === "123456") {
     return { success: true, phone };
   }
 
   if (!db) {
-    // Fallback for demo/no-DB environments
-    if (submittedCode === "123456") {
-      return { success: true, phone };
+    if (ENV.isProduction) {
+      // Fail closed: never verify OTPs without a backing store in production.
+      throw new Error("OTP store unavailable");
     }
     return { success: false, error: "invalid" };
   }

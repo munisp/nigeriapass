@@ -1,0 +1,82 @@
+{
+  "$schema": "https://apisix.apache.org/docs/apisix/admin-api",
+  "comment": "Declarative APISIX manifest. server/integrations/apisix.ts diffs this against the Admin API and applies changes. Keep in sync with infra/apisix/apisix-standalone.yaml.",
+  "upstreams": [
+    {
+      "id": "app",
+      "type": "roundrobin",
+      "retries": 1,
+      "timeout": { "connect": 5, "send": 30, "read": 60 },
+      "nodes": [{ "host": "host.docker.internal", "port": 3000, "weight": 1 }],
+      "checks": {
+        "active": {
+          "http_path": "/healthz",
+          "healthy": { "interval": 10, "successes": 2 },
+          "unhealthy": { "interval": 5, "http_failures": 3 }
+        }
+      }
+    }
+  ],
+  "routes": [
+    {
+      "id": "api-trpc",
+      "uris": ["/api/trpc/*"],
+      "upstream_id": "app",
+      "plugins": {
+        "limit-req": {
+          "rate": 20,
+          "burst": 40,
+          "rejected_code": 429,
+          "key_type": "var",
+          "key": "remote_addr"
+        },
+        "prometheus": {}
+      }
+    },
+    {
+      "id": "api-webhooks",
+      "uris": ["/api/webhooks/*"],
+      "upstream_id": "app",
+      "plugins": {
+        "prometheus": {}
+      }
+    },
+    {
+      "id": "ussd-callback",
+      "uris": ["/api/ussd/*"],
+      "upstream_id": "app",
+      "plugins": {
+        "limit-count": {
+          "count": 500,
+          "time_window": 60,
+          "rejected_code": 429,
+          "key": "remote_addr"
+        }
+      }
+    },
+    {
+      "id": "pwa-static",
+      "uris": ["/*"],
+      "upstream_id": "app",
+      "priority": -10
+    },
+    {
+      "id": "backoffice-sso",
+      "uris": ["/backoffice/*"],
+      "upstream_id": "app",
+      "enable": false,
+      "comment": "Enable with Keycloak (extended profile). openid-connect validates against the keycloak realm; openappsec attaches once the agent is baked into the image.",
+      "plugins": {
+        "openid-connect": {
+          "client_id": "nigerianpass-backoffice",
+          "client_secret": "${KEYCLOAK_CLIENT_SECRET}",
+          "discovery": "http://keycloak:8080/realms/nigerianpass/.well-known/openid-configuration",
+          "scope": "openid profile roles",
+          "bearer_only": false,
+          "realm": "nigerianpass"
+        },
+        "openappsec": {}
+      }
+    }
+  ]
+}

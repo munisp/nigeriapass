@@ -350,24 +350,9 @@ export default function DeviceManagement() {
     needsUpdate: devices.filter(d => d.firmware !== d.latestFirmware).length,
   };
 
-  // Simulate live metric fluctuation every 5 s when no real WS data arrives
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (liveDevices.length === 0) {
-        setDevices(prev => prev.map(d => {
-          if (d.status !== "online") return d;
-          return {
-            ...d,
-            cpu: Math.min(100, Math.max(3, d.cpu + (Math.random() * 6 - 3))),
-            memory: Math.min(100, Math.max(10, d.memory + (Math.random() * 4 - 2))),
-            temp: Math.min(85, Math.max(30, d.temp + (Math.random() * 2 - 1))),
-            lastSeen: "Just now",
-          };
-        }));
-      }
-    }, 5_000);
-    return () => clearInterval(interval);
-  }, [liveDevices.length]);
+  // No simulated metric fluctuation — when no live heartbeat stream is
+  // connected, the UI shows the last server-fetched snapshot unchanged and the
+  // banner below reports the disconnected state honestly.
 
   return (
     <PortalLayout title="Device Management" subtitle="Monitor and manage all toll booth hardware">
@@ -389,7 +374,7 @@ export default function DeviceManagement() {
           {wsConnected
             ? `Live WebSocket connected — metrics updating in real-time${lastUpdate ? ` · Last: ${lastUpdate.toLocaleTimeString()}` : ""}`
             : wsError
-            ? `${wsError} · Simulating metrics locally`
+            ? `${wsError} · Showing last known server snapshot (no live metrics)`
             : "Connecting to device heartbeat stream..."}
           <button onClick={() => refresh()} className="ml-auto hover:text-foreground transition-colors">
             <RefreshCw className="w-3 h-3" />

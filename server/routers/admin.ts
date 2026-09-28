@@ -29,6 +29,8 @@ import { reconcile } from "../jobs/reconcile";
 import { users } from "../../drizzle/schema";
 import { asc } from "drizzle-orm";
 import { createReconciliationRun, getReconciliationRuns, resolveReconciliationRun } from "../db";
+import { audit } from "../_core/audit";
+import { refunds } from "../../drizzle/schema";
 
 // ── Admin-only guard ──────────────────────────────────────────────────────────
 const adminProcedure = protectedProcedure.use(({ ctx, next }) => {
@@ -47,6 +49,21 @@ const ReviewDecisionSchema = z.object({
   reviewNotes: z.string().optional(),
   kycScore: z.number().min(0).max(100).optional(),
 });
+
+
+/**
+ * Extract the applicant phone from formData regardless of which key the
+ * per-type form used (P1-16): driver uses "phone", fleet uses
+ * "contact_phone", vehicle uses "owner_phone". Also normalises the contact
+ * name across keys.
+ */
+function applicantContact(formData: unknown): { phone?: string; name?: string } {
+  const fd = (formData ?? {}) as Record<string, unknown>;
+  return {
+    phone: (fd.contact_phone ?? fd.phone ?? fd.owner_phone ?? fd.contactPhone) as string | undefined,
+    name: (fd.contact_name ?? fd.full_name ?? fd.owner_name ?? fd.business_name) as string | undefined,
+  };
+}
 
 export const adminRouter = router({
   /**
@@ -156,6 +173,7 @@ export const adminRouter = router({
         reviewedBy: ctx.user.id,
         kycScore: input.kycScore,
       });
+      void audit(ctx, "kyc.approve", "kyc_application", input.referenceId, { type: app.type, from: app.status });
 
       // Emit live WebSocket push to the applicant's status page
       const emitter = getKycStatusEmitter();
@@ -170,9 +188,9 @@ export const adminRouter = router({
       });
 
       // Send SMS notification to applicant if phone is available in formData
-      const approvePhone = (app.formData as Record<string, unknown>)?.contact_phone as string | undefined;
+      const approvePhone = applicantContact(app.formData).phone;
       if (approvePhone) {
-        const approveContactName = (app.formData as Record<string, unknown>)?.contact_name as string | undefined;
+        const approveContactName = applicantContact(app.formData).name;
         sendSms(approvePhone, kycApprovedMessage(input.referenceId, approveContactName)).catch((err) =>
           console.error(`[Admin] SMS approve notification failed for ${input.referenceId}:`, err)
         );
@@ -207,6 +225,7 @@ export const adminRouter = router({
         reviewedBy: ctx.user.id,
         kycScore: input.kycScore,
       });
+      void audit(ctx, "kyc.reject", "kyc_application", input.referenceId, { type: app.type, from: app.status });
 
       const emitter = getKycStatusEmitter();
       emitter.emit("status_changed", {
@@ -220,9 +239,9 @@ export const adminRouter = router({
       });
 
       // Send SMS notification to applicant
-      const rejectPhone = (app.formData as Record<string, unknown>)?.contact_phone as string | undefined;
+      const rejectPhone = applicantContact(app.formData).phone;
       if (rejectPhone) {
-        sendSms(rejectPhone, kycRejectedMessage(input.referenceId, input.reviewNotes, (app.formData as Record<string, unknown>)?.contact_name as string)).catch((err) =>
+        sendSms(rejectPhone, kycRejectedMessage(input.referenceId, input.reviewNotes, applicantContact(app.formData).name)).catch((err) =>
           console.error(`[Admin] SMS reject notification failed for ${input.referenceId}:`, err)
         );
       }
@@ -251,6 +270,7 @@ export const adminRouter = router({
         reviewedBy: ctx.user.id,
         kycScore: input.kycScore,
       });
+      void audit(ctx, "kyc.resubmit", "kyc_application", input.referenceId, { type: app.type, from: app.status });
 
       const emitter = getKycStatusEmitter();
       emitter.emit("status_changed", {
@@ -264,9 +284,9 @@ export const adminRouter = router({
       });
 
       // Send SMS notification to applicant
-      const resubPhone = (app.formData as Record<string, unknown>)?.contact_phone as string | undefined;
+      const resubPhone = applicantContact(app.formData).phone;
       if (resubPhone) {
-        sendSms(resubPhone, kycResubmissionMessage(input.referenceId, input.reviewNotes, (app.formData as Record<string, unknown>)?.contact_name as string)).catch((err) =>
+        sendSms(resubPhone, kycResubmissionMessage(input.referenceId, input.reviewNotes, applicantContact(app.formData).name)).catch((err) =>
           console.error(`[Admin] SMS resubmission notification failed for ${input.referenceId}:`, err)
         );
       }
@@ -380,9 +400,11 @@ export const adminRouter = router({
       }
 
       const { users } = await import("../../drizzle/schema");
+      const [target] = await db.select({ role: users.role }).from(users).where(eq(users.id, input.userId)).limit(1);
       await db.update(users)
         .set({ role: input.role })
         .where(eq(users.id, input.userId));
+      void audit(ctx, "user.setRole", "user", input.userId, { from: target?.role ?? null, to: input.role });
 
       return { success: true, userId: input.userId, newRole: input.role };
     }),
@@ -420,8 +442,8 @@ export const adminRouter = router({
     .query(async () => {
       const db = await getDb();
       if (!db) {
-        // Return demo data when DB is unavailable
-        return getDemoStats();
+        // Explicitly flagged demo data when DB is unavailable (P1-17)
+        return { ...getDemoStats(), is_demo: true as const };
       }
 
       try {
@@ -475,7 +497,7 @@ export const adminRouter = router({
           })),
         };
       } catch {
-        return getDemoStats();
+        return { ...getDemoStats(), is_demo: true as const };
       }
     }),
 
@@ -602,6 +624,105 @@ export const adminRouter = router({
     }
   }),
 
+  // ── Refunds (P1-19) ────────────────────────────────────────────────────────
+
+  /**
+   * Issue a refund. Amounts > ₦50,000 (5,000,000 kobo) require a second
+   * admin's approval (4-eyes principle) — the refund is recorded as
+   * "awaiting_second_approval" and the provider call is deferred.
+   */
+  issueRefund: adminProcedure
+    .input(z.object({
+      walletId: z.number().int().positive(),
+      transactionId: z.number().int().positive().optional(),
+      amountKobo: z.number().int().positive().max(100_000_000),
+      reason: z.string().min(10).max(500),
+      /** Payment provider reference to refund against (required for provider refund) */
+      paymentReference: z.string().min(1),
+      provider: z.enum(["paystack", "flutterwave", "interswitch"]),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      const db = await getDb();
+      if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
+
+      const FOUR_EYES_THRESHOLD_KOBO = 50_000 * 100; // ₦50,000
+      const needsSecondApproval = input.amountKobo > FOUR_EYES_THRESHOLD_KOBO;
+      const refundRef = `RFD-${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
+
+      const [row] = await db.insert(refunds).values({
+        refundRef,
+        walletId: input.walletId,
+        transactionId: input.transactionId ?? null,
+        amountKobo: input.amountKobo,
+        reason: input.reason,
+        status: needsSecondApproval ? "awaiting_second_approval" : "approved",
+        requestedBy: ctx.user.id,
+      }).returning({ id: refunds.id });
+
+      void audit(ctx, "refund.issue", "refund", refundRef, {
+        walletId: input.walletId,
+        amountKobo: input.amountKobo,
+        needsSecondApproval,
+        reason: input.reason,
+      });
+
+      if (needsSecondApproval) {
+        return {
+          refundRef,
+          status: "awaiting_second_approval" as const,
+          message: "Refund over ₦50,000 recorded — a second admin must call approveRefund before it is processed.",
+        };
+      }
+
+      // Below threshold: process immediately
+      const result = await processRefund(refundRef, input.provider, input.paymentReference, input.amountKobo, ctx.user.id);
+      return { refundRef, status: result.status, message: result.message };
+    }),
+
+  /**
+   * Second-admin approval for large refunds (4-eyes). The approver must not
+   * be the requester.
+   */
+  approveRefund: adminProcedure
+    .input(z.object({
+      refundRef: z.string().min(1),
+      provider: z.enum(["paystack", "flutterwave", "interswitch"]),
+      paymentReference: z.string().min(1),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      const db = await getDb();
+      if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
+
+      const [refund] = await db.select().from(refunds).where(eq(refunds.refundRef, input.refundRef)).limit(1);
+      if (!refund) throw new TRPCError({ code: "NOT_FOUND", message: "Refund not found" });
+      if (refund.status !== "awaiting_second_approval") {
+        throw new TRPCError({ code: "BAD_REQUEST", message: `Refund is ${refund.status}, not awaiting approval` });
+      }
+      if (refund.requestedBy === ctx.user.id) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "4-eyes violation: the requester cannot approve their own refund" });
+      }
+
+      await db.update(refunds)
+        .set({ status: "approved", approvedBy: ctx.user.id, updatedAt: new Date() })
+        .where(eq(refunds.refundRef, input.refundRef));
+
+      void audit(ctx, "refund.approve", "refund", input.refundRef, { requestedBy: refund.requestedBy });
+
+      const result = await processRefund(input.refundRef, input.provider, input.paymentReference, refund.amountKobo, ctx.user.id);
+      return { refundRef: input.refundRef, status: result.status, message: result.message };
+    }),
+
+  /** List refunds (most recent first). */
+  listRefunds: adminProcedure
+    .input(z.object({ limit: z.number().int().min(1).max(200).default(50) }).optional())
+    .query(async ({ input }) => {
+      const db = await getDb();
+      if (!db) return [];
+      return db.select().from(refunds)
+        .orderBy(desc(refunds.createdAt))
+        .limit(input?.limit ?? 50);
+    }),
+
   /**
    * Rich analytics aggregations for the AdminAnalytics dashboard.
    * Returns daily KYC outcomes (last N days), rejection reasons, app type breakdown,
@@ -611,7 +732,7 @@ export const adminRouter = router({
     .input(z.object({ days: z.number().int().min(1).max(90).default(30) }))
     .query(async ({ input }) => {
       const db = await getDb();
-      if (!db) return getDemoAnalytics(input.days);
+      if (!db) return { ...getDemoAnalytics(input.days), is_demo: true as const };
 
       try {
         const { walletTransactions } = await import("../../drizzle/schema");
@@ -760,7 +881,7 @@ export const adminRouter = router({
         };
       } catch (err) {
         console.warn("[Admin] getAnalytics DB error, returning demo data:", err);
-        return getDemoAnalytics(input.days);
+        return { ...getDemoAnalytics(input.days), is_demo: true as const };
       }
     }),
 
@@ -923,4 +1044,83 @@ function getDemoAnalytics(days: number) {
       reconFailed: 4,
     },
   };
+}
+
+// ── Refund processing helper (P1-19) ──────────────────────────────────────────
+/**
+ * Execute an approved refund: call the provider refund API, then post an
+ * atomic ledger reversal (refund entry + conditional balance decrement) in a
+ * single DB transaction. Failures mark the refund row "failed" — no partial
+ * state is committed.
+ */
+async function processRefund(
+  refundRef: string,
+  provider: "paystack" | "flutterwave" | "interswitch",
+  paymentReference: string,
+  amountKobo: number,
+  adminUserId: number,
+): Promise<{ status: "processed" | "failed"; message: string }> {
+  const db = await getDb();
+  if (!db) return { status: "failed", message: "Database unavailable" };
+
+  // 1. Provider-side refund
+  const { requestProviderRefund } = await import("../payments/gateway");
+  let providerRef: string;
+  try {
+    const r = await requestProviderRefund(provider, paymentReference, amountKobo);
+    providerRef = r.providerRef;
+  } catch (err) {
+    await db.update(refunds)
+      .set({ status: "failed", updatedAt: new Date() })
+      .where(eq(refunds.refundRef, refundRef));
+    console.error(`[Refunds] Provider refund failed for ${refundRef}:`, err);
+    return { status: "failed", message: `Provider refund failed: ${(err as Error).message}` };
+  }
+
+  // 2. Ledger reversal — atomic, guarded against negative balance
+  try {
+    const { walletAccounts, walletTransactions } = await import("../../drizzle/schema");
+    const [refund] = await db.select().from(refunds).where(eq(refunds.refundRef, refundRef)).limit(1);
+    if (!refund) throw new Error("Refund row disappeared");
+
+    await db.transaction(async (tx) => {
+      const upd = await tx
+        .update(walletAccounts)
+        .set({
+          balanceKobo: sql`${walletAccounts.balanceKobo} - ${amountKobo}`,
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(walletAccounts.id, refund.walletId),
+          sql`${walletAccounts.balanceKobo} >= ${amountKobo}`,
+        ))
+        .returning({ balanceKobo: walletAccounts.balanceKobo });
+
+      if (upd.length === 0) {
+        throw new Error("Insufficient wallet balance for ledger reversal");
+      }
+
+      await tx.insert(walletTransactions).values({
+        walletId: refund.walletId,
+        type: "refund",
+        amountKobo: -amountKobo,
+        balanceAfterKobo: upd[0]!.balanceKobo,
+        externalRef: refundRef,
+        description: `Refund ${refundRef} (provider ref ${providerRef})`,
+      });
+    });
+
+    await db.update(refunds)
+      .set({ status: "processed", providerRef, updatedAt: new Date() })
+      .where(eq(refunds.refundRef, refundRef));
+
+    console.log(`[Refunds] ${refundRef} processed by admin ${adminUserId}: ${providerRef}`);
+    return { status: "processed", message: `Refund processed (${providerRef})` };
+  } catch (err) {
+    await db.update(refunds)
+      .set({ status: "failed", updatedAt: new Date() })
+      .where(eq(refunds.refundRef, refundRef));
+    console.error(`[Refunds] Ledger reversal failed for ${refundRef}:`, err);
+    return { status: "failed", message: `Ledger reversal failed: ${(err as Error).message}` };
+  }
 }

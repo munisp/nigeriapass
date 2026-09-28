@@ -16,7 +16,24 @@ import { appRouter } from "./routers";
 import type { TrpcContext } from "./_core/context";
 
 // ── Mock the DB helpers so tests don't need a real DB ─────────────────────────
+// `existingApps` controls what the dedup lookup (db.select(...).limit(1)) in
+// sync.processQueue / sync.submitKycDraft returns — empty means "no duplicate".
+const { existingApps } = vi.hoisted(() => ({
+  existingApps: { rows: [] as unknown[] },
+}));
+
 vi.mock("./db", () => ({
+  getDb: vi.fn().mockImplementation(() =>
+    Promise.resolve({
+      select: () => ({
+        from: () => ({
+          where: () => ({
+            limit: () => Promise.resolve(existingApps.rows),
+          }),
+        }),
+      }),
+    })
+  ),
   getOrCreateWalletAccount: vi.fn().mockResolvedValue({
     id: 1,
     userId: 42,
@@ -167,16 +184,34 @@ describe("sync.kycStatuses", () => {
 // ── sync.processQueue ─────────────────────────────────────────────────────────
 
 describe("sync.processQueue", () => {
+  // Server-side per-type validation (P1-13): submitKycDraft replays are
+  // validated with the same zod schemas as direct submissions, so the fixture
+  // must be a fully schema-valid driver application (fullName, 11-digit NIN,
+  // NG phone, age ≥ 18, address, state, livenessScore ≥ 60).
+  const validDriverFormData = {
+    fullName: "Amaka Okafor",
+    nin: "12345678901",
+    phone: "+2348012345678",
+    dateOfBirth: "1990-05-15",
+    address: "12 Adeola Odeku Street, Victoria Island",
+    state: "Lagos",
+    livenessScore: 85,
+  };
+
   const validKycItem = {
     id: "client-uuid-001",
     url: "/api/trpc/sync.submitKycDraft",
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ type: "driver", formData: { firstName: "Amaka" }, clientVersion: 1 }),
+    body: JSON.stringify({ type: "driver", formData: validDriverFormData, clientVersion: 1 }),
     label: "kyc-driver-onboarding",
     attempts: 0,
     createdAt: Date.now() - 60000,
   };
+
+  beforeEach(() => {
+    existingApps.rows = [];
+  });
 
   it("processes a valid KYC queued item and returns success", async () => {
     const caller = appRouter.createCaller(createAuthContext());
@@ -187,6 +222,20 @@ describe("sync.processQueue", () => {
     expect(result.failed).toBe(0);
     expect(result.results[0]?.success).toBe(true);
     expect(result.results[0]?.id).toBe("client-uuid-001");
+  });
+
+  it("dedupes a replayed clientId (returns existing referenceId, no new application)", async () => {
+    // A previously-processed queue item (same clientId → same derived draftId)
+    // must NOT create a second application; the server returns the existing one.
+    existingApps.rows = [{ referenceId: "DRV-EXIST1" }];
+
+    const caller = appRouter.createCaller(createAuthContext());
+    const result = await caller.sync.processQueue({ items: [validKycItem] });
+
+    expect(result.processed).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(result.results[0]?.success).toBe(true);
+    expect(result.results[0]?.referenceId).toBe("DRV-EXIST1");
   });
 
   it("rejects items with non-/api/ URLs (SSRF protection)", async () => {

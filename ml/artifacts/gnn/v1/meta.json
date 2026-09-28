@@ -1,0 +1,30 @@
+{
+  "model": "gnn",
+  "version": "v1",
+  "metrics": {
+    "auc": 0.8439916547504629,
+    "pr_auc": 0.49328193154309435,
+    "f1": 0.09242718446601941,
+    "confusion": {
+      "tn": 5044,
+      "fp": 2311,
+      "fn": 26,
+      "tp": 119
+    },
+    "base_rate": 0.019333333333333334,
+    "val_auc": 0.8253457585383389,
+    "train_seconds": 9.8
+  },
+  "params": {
+    "hidden": 32,
+    "epochs": 20,
+    "lr": 0.005,
+    "fanouts": [
+      10,
+      10
+    ],
+    "seed": 42
+  },
+  "onnx_exported": true,
+  "created_at": "2026-09-28T11:03:20Z"
+}

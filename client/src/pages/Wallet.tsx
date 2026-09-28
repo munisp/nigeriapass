@@ -25,71 +25,8 @@ import { useLocation } from "wouter";
 import { PaymentProviderSelector, type PaymentProviderSlug } from "@/components/PaymentProviderSelector";
 import { useWalletCreditPush, type WalletCreditedEvent, type TierUpgradedEvent } from "@/hooks/useWalletCreditPush";
 
-// ── Demo data ─────────────────────────────────────────────────────────────────
-const DEMO_BALANCE: WalletBalance = {
-  account_id: "TB-ACC-001",
-  balance_kobo: 465000,
-  pending_kobo: 35000,
-  currency: "NGN",
-  tier: "standard",
-  daily_cap_kobo: 500000,
-  daily_spent_kobo: 180000,
-  fare_cap_limit_kobo: 500000,
-  fare_cap_reset_date: new Date(Date.now() + 1000 * 60 * 60 * 24 * 12).toISOString(),
-  last_updated: new Date().toISOString(),
-};
-
-const DEMO_TRANSACTIONS: Transaction[] = [
-  {
-    id: "TXN-001", type: "toll_charge", amount_kobo: 35000, direction: "debit",
-    description: "Lagos-Ibadan Expressway — Sagamu Interchange",
-    reference: "REF-001", plaza: "Sagamu", vehicle_plate: "ABC-123-XY",
-    created_at: new Date(Date.now() - 1000 * 60 * 30).toISOString(),
-    status: "completed", balance_after_kobo: 465000,
-  },
-  {
-    id: "TXN-002", type: "topup", amount_kobo: 500000, direction: "credit",
-    description: "Wallet top-up via Paystack",
-    reference: "REF-002",
-    created_at: new Date(Date.now() - 1000 * 60 * 60 * 2).toISOString(),
-    status: "completed", balance_after_kobo: 500000,
-  },
-  {
-    id: "TXN-003", type: "toll_charge", amount_kobo: 70000, direction: "debit",
-    description: "Lekki-Epe Expressway — Lekki Toll Gate",
-    reference: "REF-003", plaza: "Lekki", vehicle_plate: "ABC-123-XY",
-    created_at: new Date(Date.now() - 1000 * 60 * 60 * 5).toISOString(),
-    status: "completed", balance_after_kobo: 0,
-  },
-  {
-    id: "TXN-004", type: "toll_charge", amount_kobo: 35000, direction: "debit",
-    description: "Lagos-Ibadan Expressway — Berger Toll",
-    reference: "REF-004", plaza: "Berger", vehicle_plate: "ABC-123-XY",
-    created_at: new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString(),
-    status: "completed", balance_after_kobo: 70000,
-  },
-  {
-    id: "TXN-005", type: "topup", amount_kobo: 1000000, direction: "credit",
-    description: "Wallet top-up via Flutterwave",
-    reference: "REF-005",
-    created_at: new Date(Date.now() - 1000 * 60 * 60 * 26).toISOString(),
-    status: "completed", balance_after_kobo: 105000,
-  },
-  {
-    id: "TXN-006", type: "toll_charge", amount_kobo: 105000, direction: "debit",
-    description: "Abuja-Kaduna Expressway — Gwagwalada",
-    reference: "REF-006", plaza: "Gwagwalada", vehicle_plate: "DEF-456-AB",
-    created_at: new Date(Date.now() - 1000 * 60 * 60 * 48).toISOString(),
-    status: "completed", balance_after_kobo: 0,
-  },
-  {
-    id: "TXN-007", type: "refund", amount_kobo: 35000, direction: "credit",
-    description: "Refund — duplicate charge TXN-003",
-    reference: "REF-007",
-    created_at: new Date(Date.now() - 1000 * 60 * 60 * 72).toISOString(),
-    status: "completed", balance_after_kobo: 105000,
-  },
-];
+// No demo/seed data — balance and transactions come from trpc.wallet queries
+// and the page shows the server's error state when they fail.
 
 const TOP_UP_AMOUNTS = [1000, 2000, 5000, 10000, 20000, 50000];
 
@@ -292,7 +229,7 @@ ${tx.plazaId ? `<p><strong>Plaza:</strong> ${tx.plazaId}</p>` : ""}
       "all": 0,
     };
     return transactions.filter(t => {
-      const txnType = t.type === "toll" ? "toll_charge" : t.type;
+      const txnType = t.type;
       if (filterType !== "all" && txnType !== filterType) return false;
       if (new Date(t.created_at).getTime() < cutoff[dateRange]) return false;
       if (searchQuery && !t.description.toLowerCase().includes(searchQuery.toLowerCase()) &&
@@ -330,13 +267,13 @@ ${tx.plazaId ? `<p><strong>Plaza:</strong> ${tx.plazaId}</p>` : ""}
   // ── Monthly toll spend ─────────────────────────────────────────────────────
   const monthlyTollSpend = useMemo(() =>
     transactions
-      .filter(t => (t.type === "toll_charge" || t.type === "toll") &&
+      .filter(t => (t.type === "toll_charge") &&
         new Date(t.created_at) > new Date(Date.now() - 30 * 86400_000))
       .reduce((s, t) => s + t.amount_kobo, 0),
     [transactions]
   );
 
-  const tollCount = transactions.filter(t => t.type === "toll_charge" || t.type === "toll").length;
+  const tollCount = transactions.filter(t => t.type === "toll_charge").length;
   const lastTopUp = transactions.find(t => t.type === "topup");
 
   if (loading) {
@@ -345,6 +282,23 @@ ${tx.plazaId ? `<p><strong>Plaza:</strong> ${tx.plazaId}</p>` : ""}
         <div className="flex flex-col items-center gap-3">
           <div className="w-8 h-8 border-2 border-primary/30 border-t-primary rounded-full animate-spin" />
           <p className="text-sm text-muted-foreground">Loading wallet...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (balanceQuery.isError) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-6">
+        <div className="flex flex-col items-center gap-3 max-w-sm text-center">
+          <X className="w-8 h-8 text-destructive" />
+          <p className="text-sm font-medium text-foreground">Wallet unavailable</p>
+          <p className="text-xs text-muted-foreground">
+            {balanceQuery.error?.message ?? "Could not load your wallet balance. Please try again."}
+          </p>
+          <Button variant="outline" size="sm" onClick={() => balanceQuery.refetch()} className="gap-1.5">
+            <RefreshCw className="w-3.5 h-3.5" /> Retry
+          </Button>
         </div>
       </div>
     );
@@ -542,7 +496,7 @@ ${tx.plazaId ? `<p><strong>Plaza:</strong> ${tx.plazaId}</p>` : ""}
           ) : (
             <div className="divide-y divide-border">
               {paginated.map((txn, i) => {
-                const isToll = txn.type === "toll_charge" || txn.type === "toll";
+                const isToll = txn.type === "toll_charge";
                 const isTopup = txn.type === "topup";
                 const isCredit = txn.direction === "credit";
                 return (
@@ -791,7 +745,7 @@ ${tx.plazaId ? `<p><strong>Plaza:</strong> ${tx.plazaId}</p>` : ""}
               <div className="flex-1 overflow-y-auto p-5 space-y-5">
                 {/* Amount hero */}
                 {(() => {
-                  const isToll = selectedTxn.type === "toll_charge" || selectedTxn.type === "toll";
+                  const isToll = selectedTxn.type === "toll_charge";
                   const isTopup = selectedTxn.type === "topup";
                   const isCredit = selectedTxn.direction === "credit";
                   return (

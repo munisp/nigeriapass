@@ -5,7 +5,7 @@
  *  - devices.getPlazaQrCode — signed QR URI generation for NFC reader stations
  *  - devices.simulateHeartbeat — emits a heartbeat event for a known device
  */
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { TRPCError } from "@trpc/server";
 
 // ── Shared mock DB state ───────────────────────────────────────────────────────
@@ -105,6 +105,14 @@ describe("Device QR Code Generation", () => {
   beforeEach(() => {
     resetDb();
     vi.clearAllMocks();
+    // QR HMAC secret fallback was removed (audit v13, P0-6): the router throws
+    // PRECONDITION_FAILED when no signing secret is configured. Provide one.
+    vi.stubEnv("NFC_MASTER_SECRET", "test-qr-signing-secret");
+    vi.stubEnv("JWT_SECRET", "test-qr-signing-secret");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   describe("devices.getPlazaQrCode", () => {

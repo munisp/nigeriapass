@@ -16,7 +16,7 @@
 import { z } from "zod";
 import { createHmac } from "crypto";
 import { TRPCError } from "@trpc/server";
-import { protectedProcedure, router } from "../_core/trpc";
+import { protectedProcedure, adminProcedure, operatorProcedure, router } from "../_core/trpc";
 import { getDb } from "../db";
 import { tollDevices, deviceAlertLogs, qrScanLogs } from "../../drizzle/schema";
 import { eq, desc, and, ilike, or, sql, gte, lte } from "drizzle-orm";
@@ -26,16 +26,17 @@ import { notifyOwner } from "../_core/notification";
 import { emitDeviceHeartbeat } from "../deviceHeartbeat";
 import { ENV } from "../_core/env";
 
-/** Shared HMAC secret for QR code signing — prefers NFC_MASTER_SECRET, falls back to JWT_SECRET */
-const QR_HMAC_SECRET = () => ENV.nfcMasterSecret || process.env.JWT_SECRET || "nigerianpass-qr-secret";
+/** Shared HMAC secret for QR code signing — NFC_MASTER_SECRET or JWT_SECRET.
+ *  No hardcoded fallback (audit v13, P0-6); throws when neither is configured. */
+const QR_HMAC_SECRET = () => {
+  const secret = ENV.nfcMasterSecret || process.env.JWT_SECRET || "";
+  if (!secret) {
+    throw new TRPCError({ code: "PRECONDITION_FAILED", message: "QR signing secret (NFC_MASTER_SECRET/JWT_SECRET) is not configured" });
+  }
+  return secret;
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-function adminOnly(role: string | undefined) {
-  if (role !== "admin") {
-    throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-  }
-}
 
 const DeviceInput = z.object({
   serial: z.string().min(3).max(64),
@@ -43,7 +44,7 @@ const DeviceInput = z.object({
   type: z.enum(["nfc_reader", "barrier", "camera", "display", "edge_unit"]),
   plaza: z.string().min(2).max(128),
   lane: z.string().min(1).max(64),
-  status: z.enum(["online", "offline", "warning", "maintenance"]).default("offline"),
+  status: z.enum(["online", "offline", "warning", "maintenance", "lost", "stolen", "decommissioned"]).default("offline"),
   firmware: z.string().max(32).default("1.0.0"),
   latestFirmware: z.string().max(32).default("1.0.0"),
   uptime: z.string().max(32).optional(),
@@ -63,7 +64,7 @@ export const devicesRouter = router({
   list: protectedProcedure
     .input(z.object({
       plaza: z.string().optional(),
-      status: z.enum(["online", "offline", "warning", "maintenance", "all"]).default("all"),
+      status: z.enum(["online", "offline", "warning", "maintenance", "lost", "stolen", "decommissioned", "all"]).default("all"),
       search: z.string().optional(),
     }).default({ status: "all" }))
     .query(async ({ input }) => {
@@ -119,10 +120,9 @@ export const devicesRouter = router({
   /**
    * Create a new device. Admin only.
    */
-  create: protectedProcedure
+  create: adminProcedure
     .input(DeviceInput)
     .mutation(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
 
@@ -156,13 +156,12 @@ export const devicesRouter = router({
   /**
    * Update device fields. Admin only.
    */
-  update: protectedProcedure
+  update: adminProcedure
     .input(z.object({
       id: z.number().int().positive(),
       data: DeviceInput.partial(),
     }))
     .mutation(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
 
@@ -179,10 +178,9 @@ export const devicesRouter = router({
   /**
    * Delete a device. Admin only.
    */
-  delete: protectedProcedure
+  delete: adminProcedure
     .input(z.object({ id: z.number().int().positive() }))
     .mutation(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
 
@@ -199,7 +197,7 @@ export const devicesRouter = router({
    * Upsert live telemetry from the heartbeat service. Admin only.
    * Called by the Python heartbeat microservice via REST → tRPC bridge.
    */
-  updateHeartbeat: protectedProcedure
+  updateHeartbeat: operatorProcedure
     .input(z.object({
       serial: z.string().min(3).max(64),
       status: z.enum(["online", "offline", "warning", "maintenance"]),
@@ -209,7 +207,6 @@ export const devicesRouter = router({
       uptime: z.string().optional(),
     }))
     .mutation(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
 
@@ -235,10 +232,9 @@ export const devicesRouter = router({
    * Seed the toll_devices table with the 12 known NigerianPass plaza locations.
    * Admin only. Idempotent — skips devices whose serial already exists.
    */
-  seed: protectedProcedure
+  seed: adminProcedure
     .input(z.object({ force: z.boolean().default(false) }).default({ force: false }))
     .mutation(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
 
@@ -326,7 +322,7 @@ export const devicesRouter = router({
    * Simulate a device heartbeat from the admin portal (for testing without physical hardware).
    * Admin only.
    */
-  simulateHeartbeat: protectedProcedure
+  simulateHeartbeat: operatorProcedure
     .input(z.object({
       serial: z.string().min(3).max(64),
       status: z.enum(["online", "offline", "warning", "maintenance"]).default("online"),
@@ -335,7 +331,6 @@ export const devicesRouter = router({
       temp: z.number().default(38),
     }))
     .mutation(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
 
@@ -371,12 +366,11 @@ export const devicesRouter = router({
    * Returns a signed nigerianpass://station/{stationId} URI that plaza operators
    * can print and mount for tap-in/tap-out.
    */
-  getPlazaQrCode: protectedProcedure
+  getPlazaQrCode: adminProcedure
     .input(z.object({
       serial: z.string().min(3).max(64),
     }))
     .mutation(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
 
@@ -410,12 +404,11 @@ export const devicesRouter = router({
    * Each NFC reader gets its own section with station name, serial, lane, and QR code.
    * Returns base64-encoded PDF bytes.
    */
-  printPlazaQrSheet: protectedProcedure
+  printPlazaQrSheet: adminProcedure
     .input(z.object({
       plaza: z.string().min(2).max(128),
     }))
     .mutation(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
 
@@ -541,13 +534,12 @@ export const devicesRouter = router({
    * Resolve all active alerts on a device.
    * Clears the alert count and persists a resolution note.
    */
-  resolveAlert: protectedProcedure
+  resolveAlert: adminProcedure
     .input(z.object({
       id: z.number().int().positive(),
       note: z.string().max(512).optional(),
     }))
     .mutation(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
 
@@ -614,13 +606,12 @@ export const devicesRouter = router({
    * Get alert resolution history for a device.
    * Returns the last 50 entries ordered by most recent first.
    */
-  getAlertHistory: protectedProcedure
+  getAlertHistory: adminProcedure
     .input(z.object({
       deviceId: z.number().int().positive(),
       limit: z.number().int().min(1).max(100).default(50),
     }))
     .query(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
 
@@ -639,14 +630,13 @@ export const devicesRouter = router({
    * Invalidates the old signature by generating a new signed URI with a fresh
    * timestamp and a new HMAC. Returns the new signed URI and expiry timestamp.
    */
-  rotateQrCode: protectedProcedure
+  rotateQrCode: adminProcedure
     .input(z.object({
       serial: z.string().min(3).max(64),
       /** TTL in hours (default 24). Max 168 (1 week). */
       ttlHours: z.number().int().min(1).max(168).default(24),
     }))
     .mutation(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
 
@@ -683,7 +673,7 @@ export const devicesRouter = router({
    * verifies the HMAC signature, and checks expiry.
    * Returns { valid, reason, serial, plaza, lane, expiresAt }.
    */
-  validateQrCode: protectedProcedure
+  validateQrCode: operatorProcedure
     .input(z.object({
       /** Full QR URI as scanned by the gate controller */
       uri: z.string().min(10).max(1024),
@@ -760,7 +750,7 @@ export const devicesRouter = router({
    * Get QR scan audit log. Admin only.
    * Returns the most recent scans with acceptance rate summary.
    */
-  getQrScanHistory: protectedProcedure
+  getQrScanHistory: adminProcedure
     .input(z.object({
       deviceSerial: z.string().optional(),
       validFilter: z.enum(["all", "valid", "rejected"]).default("all"),
@@ -769,7 +759,6 @@ export const devicesRouter = router({
       limit: z.number().int().min(1).max(500).default(100),
     }))
     .query(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
       const conditions: any[] = [];
@@ -800,13 +789,12 @@ export const devicesRouter = router({
    * Sets latestFirmware on the device row and broadcasts a
    * firmware_update_requested event via the WebSocket heartbeat channel.
    */
-  triggerFirmwareUpdate: protectedProcedure
+  triggerFirmwareUpdate: adminProcedure
     .input(z.object({
       serial: z.string().min(3).max(64),
       targetVersion: z.string().min(1).max(32),
     }))
     .mutation(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
       const [device] = await db
@@ -867,14 +855,13 @@ export const devicesRouter = router({
    * Report the installed firmware version from a device after an OTA update.
    * Called by the device itself (or the edge unit) once the update is applied.
    */
-  reportFirmwareVersion: protectedProcedure
+  reportFirmwareVersion: adminProcedure
     .input(z.object({
       serial: z.string().min(3).max(64),
       /** The firmware version string the device is now running */
       version: z.string().min(1).max(32),
     }))
     .mutation(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
 
@@ -928,14 +915,13 @@ export const devicesRouter = router({
    * Broadcast a firmware update request to all devices at a selected plaza.
    * Admin only. Returns per-device results (sent / skipped / failed).
    */
-  broadcastFirmwareUpdate: protectedProcedure
+  broadcastFirmwareUpdate: adminProcedure
     .input(z.object({
       plaza: z.string().min(2).max(128),
       /** Target firmware version to broadcast. Defaults to each device's latestFirmware. */
       targetVersion: z.string().max(32).optional(),
     }))
     .mutation(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
 
@@ -1006,12 +992,11 @@ export const devicesRouter = router({
    * Returns counts of devices that are up-to-date vs pending update.
    * Polls every 30s on the Firmware Broadcast Dashboard.
    */
-  getFirmwareBroadcastStatus: protectedProcedure
+  getFirmwareBroadcastStatus: adminProcedure
     .input(z.object({
       plaza: z.string().optional(),
     }))
     .query(async ({ input, ctx }) => {
-      adminOnly(ctx.user.role);
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
       const conditions = input.plaza

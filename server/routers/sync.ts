@@ -19,6 +19,7 @@ import { z } from "zod";
 import {
   createKycApplication,
   generateReferenceId,
+  getDb,
   getKycApplicationsByUserId,
   getOrCreateWalletAccount,
   getWalletTransactions,
@@ -26,6 +27,9 @@ import {
   markSyncQueueItemFailed,
   upsertSyncQueueItem,
 } from "../db";
+import { kycApplications } from "../../drizzle/schema";
+import { and, eq } from "drizzle-orm";
+import { validateKycFormData, LIVENESS_THRESHOLD } from "./kyc";
 import { protectedProcedure, publicProcedure, router } from "../_core/trpc";
 
 // ── Queued item schema (mirrors client-side RetryItem) ────────────────────────
@@ -91,21 +95,54 @@ export const syncRouter = router({
           let referenceId: string | undefined;
 
           if (item.label.includes("kyc") || item.label.includes("KYC") || item.label.includes("onboard")) {
-            // KYC form submission replay
+            // KYC form submission replay — validated + idempotent (P1-13).
+            // Dedupe by clientId: a replayed queue item never creates a
+            // second application.
             const payload = item.body ? JSON.parse(item.body) : {};
             const type: "driver" | "vehicle" | "fleet" =
               payload.type ?? (item.label.includes("driver") ? "driver" : item.label.includes("vehicle") ? "vehicle" : "fleet");
+            const formData = payload.formData ?? payload;
+            const draftId: string = payload.draftId ?? `queue-${clientId}`;
 
-            referenceId = generateReferenceId(type);
-            await createKycApplication({
-              referenceId,
-              userId: ctx.user.id,
-              type,
-              status: "submitted",
-              formData: payload.formData ?? payload,
-              fromOfflineQueue: true,
-              clientVersion: payload.clientVersion ?? 1,
-            });
+            const validation = validateKycFormData(type, formData);
+            if (!validation.ok) {
+              throw new Error(`Validation failed for ${type}: ${validation.error}`);
+            }
+            if (type === "driver") {
+              const liveness = Number(formData.livenessScore ?? 0);
+              if (liveness < LIVENESS_THRESHOLD) {
+                throw new Error(`Liveness verification failed (score ${liveness} < ${LIVENESS_THRESHOLD})`);
+              }
+            }
+
+            const db = await getDb();
+            if (!db) throw new Error("Database unavailable");
+
+            const existing = await db
+              .select({ referenceId: kycApplications.referenceId })
+              .from(kycApplications)
+              .where(and(
+                eq(kycApplications.userId, ctx.user.id),
+                eq(kycApplications.type, type),
+                eq(kycApplications.draftId, draftId),
+              ))
+              .limit(1);
+
+            if (existing.length > 0) {
+              referenceId = existing[0]!.referenceId; // idempotent replay
+            } else {
+              referenceId = generateReferenceId(type);
+              await createKycApplication({
+                referenceId,
+                userId: ctx.user.id,
+                type,
+                status: "submitted",
+                formData,
+                draftId,
+                fromOfflineQueue: true,
+                clientVersion: payload.clientVersion ?? 1,
+              });
+            }
           } else if (item.label.includes("wallet") || item.label.includes("topup")) {
             // Wallet top-up replay — just acknowledge; actual payment must be re-initiated
             // because payment tokens expire. We log it so the user is notified.
@@ -144,6 +181,53 @@ export const syncRouter = router({
   submitKycDraft: protectedProcedure
     .input(KycDraftPayloadSchema)
     .mutation(async ({ ctx, input }) => {
+      // ── Server-side validation by kycType (P1-13) ────────────────────────
+      // Offline drafts are validated with the SAME zod schemas as direct
+      // submissions — being offline does not bypass validation.
+      const validation = validateKycFormData(input.type, input.formData);
+      if (!validation.ok) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: `Validation failed: ${validation.error}` });
+      }
+      // Fail-closed liveness check for driver submissions (no bypass)
+      if (input.type === "driver") {
+        const liveness = Number((input.formData as Record<string, unknown>).livenessScore ?? 0);
+        if (liveness < LIVENESS_THRESHOLD) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: `Liveness verification failed (score ${liveness} < ${LIVENESS_THRESHOLD})`,
+          });
+        }
+      }
+
+      // ── Idempotency (P1-13): UNIQUE(userId, type, draftId) ───────────────
+      // A replayed draft (SW retry / double-submit) returns the existing
+      // application instead of creating a duplicate. Clients that do not send
+      // a draftId get a deterministic fallback keyed by user+type+version.
+      const draftId = input.draftId ?? `auto-${ctx.user.id}-${input.type}-v${input.clientVersion}`;
+      const db = await getDb();
+      if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
+      const existing = await db
+        .select({
+          referenceId: kycApplications.referenceId,
+          status: kycApplications.status,
+          createdAt: kycApplications.createdAt,
+        })
+        .from(kycApplications)
+        .where(and(
+          eq(kycApplications.userId, ctx.user.id),
+          eq(kycApplications.type, input.type),
+          eq(kycApplications.draftId, draftId),
+        ))
+        .limit(1);
+      if (existing.length > 0) {
+        return {
+          referenceId: existing[0]!.referenceId,
+          status: existing[0]!.status,
+          createdAt: existing[0]!.createdAt,
+          duplicate: true,
+        };
+      }
+
       const referenceId = generateReferenceId(input.type);
       const application = await createKycApplication({
         referenceId,
@@ -151,6 +235,7 @@ export const syncRouter = router({
         type: input.type,
         status: "submitted",
         formData: input.formData,
+        draftId,
         fromOfflineQueue: true,
         clientVersion: input.clientVersion,
       });
@@ -161,6 +246,7 @@ export const syncRouter = router({
         referenceId: application.referenceId,
         status: application.status,
         createdAt: application.createdAt,
+        duplicate: false,
       };
     }),
 
@@ -199,17 +285,10 @@ export const syncRouter = router({
     .query(async ({ ctx }) => {
       const applications = await getKycApplicationsByUserId(ctx.user.id);
 
-      // If no real applications exist yet, return a demo entry so the UI is not empty
+      // No fabrication (P1-17): a user with no applications gets an empty
+      // list — never a fake DRV-DEMO entry masquerading as real data.
       if (applications.length === 0) {
-        return [{
-          id: `DRV-DEMO${ctx.user.id.toString(36).toUpperCase().padStart(3, "0")}`,
-          type: "driver" as const,
-          status: "under_review" as const,
-          submittedAt: Date.now() - 86400000 * 3,
-          updatedAt: Date.now() - 3600000,
-          kycScore: null,
-          fromOfflineQueue: false,
-        }];
+        return [];
       }
 
       return applications.map(app => ({

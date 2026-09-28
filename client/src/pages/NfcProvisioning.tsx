@@ -13,6 +13,7 @@
  */
 import { useState, useCallback } from "react";
 import { Link } from "wouter";
+import QRCode from "qrcode";
 import { trpc } from "@/lib/trpc";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -28,74 +29,17 @@ import { cn } from "@/lib/utils";
 import PortalLayout from "@/components/PortalLayout";
 import NetworkStatusBar from "@/components/NetworkStatusBar";
 
-// ── AES-128 key derivation via Web Crypto HKDF ───────────────────────────────
-// In production: master secret comes from HSM/KMS. Here we use a demo secret.
-const DEMO_MASTER_SECRET = "NigerianPass-Demo-Master-Secret-v1";
+// Key derivation is server-driven only (trpc.nfc.provision) — the master
+// secret lives in the server HSM/KMS and never reaches the client.
 
-async function deriveTagKey(tagId: string): Promise<{ keyHex: string; keyBytes: Uint8Array }> {
-  const enc = new TextEncoder();
-  const masterKeyMaterial = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(DEMO_MASTER_SECRET),
-    { name: "HKDF" },
-    false,
-    ["deriveKey"]
-  );
-
-  const derivedKey = await crypto.subtle.deriveKey(
-    {
-      name: "HKDF",
-      hash: "SHA-256",
-      salt: enc.encode("NigerianPass-NFC-Salt-v1"),
-      info: enc.encode(`tag:${tagId}`),
-    },
-    masterKeyMaterial,
-    { name: "AES-CBC", length: 128 },
-    true,
-    ["encrypt", "decrypt"]
-  );
-
-  const raw = await crypto.subtle.exportKey("raw", derivedKey);
-  const keyBytes = new Uint8Array(raw);
-  const keyHex = Array.from(keyBytes).map(b => b.toString(16).padStart(2, "0")).join("").toUpperCase();
-  return { keyHex, keyBytes };
-}
-
-// ── NDEF payload builder ──────────────────────────────────────────────────────
-function buildNdefPayload(tagId: string, vehicleRef: string, keyHex: string): string {
-  const payload = {
-    v: 1,
-    tid: tagId,
-    vref: vehicleRef,
-    k: keyHex.slice(0, 8) + "...", // truncated for NDEF (full key written to secure element)
-    ts: Date.now(),
-    issuer: "NigerianPass",
-  };
-  return JSON.stringify(payload);
-}
-
-// ── QR code SVG generator (pure JS, no library) ──────────────────────────────
-// Generates a simple data URL for display; in production use a proper QR library.
-function generateQrDataUrl(data: string): string {
-  // We encode the data as a URL-safe string and return a placeholder SVG
-  // In production: use qrcode.js or similar
-  const encoded = encodeURIComponent(data);
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
-    <rect width="200" height="200" fill="white"/>
-    <rect x="10" y="10" width="60" height="60" fill="none" stroke="#1B2B4B" stroke-width="4"/>
-    <rect x="20" y="20" width="40" height="40" fill="#1B2B4B"/>
-    <rect x="130" y="10" width="60" height="60" fill="none" stroke="#1B2B4B" stroke-width="4"/>
-    <rect x="140" y="20" width="40" height="40" fill="#1B2B4B"/>
-    <rect x="10" y="130" width="60" height="60" fill="none" stroke="#1B2B4B" stroke-width="4"/>
-    <rect x="20" y="140" width="40" height="40" fill="#1B2B4B"/>
-    <text x="100" y="108" text-anchor="middle" font-size="7" fill="#1B2B4B" font-family="monospace">
-      ${encoded.slice(0, 20)}...
-    </text>
-    <text x="100" y="120" text-anchor="middle" font-size="6" fill="#666" font-family="sans-serif">
-      NigerianPass NFC Tag
-    </text>
-  </svg>`;
-  return `data:image/svg+xml;base64,${btoa(svg)}`;
+// ── QR code generator (real scannable QR via the `qrcode` package) ───────────
+async function generateQrDataUrl(data: string): Promise<string> {
+  return QRCode.toDataURL(data, {
+    width: 320,
+    margin: 1,
+    errorCorrectionLevel: "M",
+    color: { dark: "#1B2B4B", light: "#ffffff" },
+  });
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -226,8 +170,8 @@ export default function NfcProvisioning() {
         toast.success("NFC tag provisioned successfully!");
 
       } else {
-        // QR fallback
-        const qrDataUrl = generateQrDataUrl(ndefPayload);
+        // QR fallback — real scannable QR encoding the server-signed payload
+        const qrDataUrl = await generateQrDataUrl(ndefPayload);
         const res: ProvisionResult = { tagId, vehicleRef, keyHex, method: "qr", timestamp: Date.now(), qrDataUrl };
         setResult(res);
         setProvisionedTags(prev => [res, ...prev.slice(0, 9)]);
@@ -507,7 +451,7 @@ export default function NfcProvisioning() {
                     <Button variant="outline" size="sm" className="gap-1.5" onClick={() => {
                       const a = document.createElement("a");
                       a.href = result.qrDataUrl!;
-                      a.download = `np-tag-${result.tagId}.svg`;
+                      a.download = `np-tag-${result.tagId}.png`;
                       a.click();
                     }}>
                       <Download className="w-3.5 h-3.5" /> Download QR

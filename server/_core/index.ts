@@ -19,6 +19,16 @@ import {
   authLimiter,
   generalApiLimiter,
 } from "../middleware/rateLimiter";
+import {
+  compressionMiddleware,
+  cacheControl,
+  responseTime,
+  logLatencyReport,
+} from "../middleware/perf";
+import {
+  httpMetricsMiddleware,
+  metricsExpressHandler,
+} from "../integrations/metrics";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -39,9 +49,65 @@ async function findAvailablePort(startPort: number = 3000): Promise<number> {
   throw new Error(`No available port found starting from ${startPort}`);
 }
 
+/** Stash the raw request body buffer for HMAC verification (webhooks). */
+function stashRawBody(
+  req: express.Request & { rawBody?: Buffer },
+  _res: express.Response,
+  buf: Buffer,
+) {
+  if (buf && buf.length > 0) req.rawBody = Buffer.from(buf);
+}
+
+/** Helmet-style security headers (no external dependency). */
+function securityHeaders(_req: express.Request, res: express.Response, next: express.NextFunction) {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(self), microphone=(), geolocation=(self)");
+  res.setHeader(
+    "Content-Security-Policy",
+    [
+      "default-src 'self'",
+      "script-src 'self' 'unsafe-inline'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob: https:",
+      "font-src 'self' data:",
+      "connect-src 'self' https: wss:",
+      "frame-ancestors 'none'",
+      "base-uri 'self'",
+      "form-action 'self'",
+    ].join("; ")
+  );
+  next();
+}
+
 async function startServer() {
   const app = express();
   const server = createServer(app);
+
+  app.use(securityHeaders);
+
+  // ── Performance middleware (audit v13) ────────────────────────────────────
+  // Must precede body parsers/routers so every response is timed & compressed.
+  app.use(await compressionMiddleware());
+  app.use(responseTime());
+  app.use(cacheControl());
+  app.use(httpMetricsMiddleware);
+  app.get("/metrics", metricsExpressHandler);
+  if (process.env.PERF_REPORT_INTERVAL_MS !== "0") {
+    setInterval(
+      () => logLatencyReport(),
+      Number(process.env.PERF_REPORT_INTERVAL_MS ?? 5 * 60 * 1000),
+    ).unref();
+  }
+
+  // ── Raw-body capture MUST precede the global JSON parser (audit v13, P0-3) ──
+  // HMAC signatures for payment/USSD webhooks are computed over the exact raw
+  // payload. Registering express.json({ verify }) for these paths first both
+  // parses the body AND stashes the untouched buffer on req.rawBody.
+  app.use("/api/payments", express.json({ limit: "2mb", verify: stashRawBody }));
+  app.use("/api/ussd", express.urlencoded({ limit: "1mb", extended: true, verify: stashRawBody }));
+
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
@@ -54,8 +120,10 @@ async function startServer() {
   app.use("/api/trpc/otp.verify", otpVerifyLimiter);
   // Auth endpoints — login, register, logout
   app.use("/api/trpc/auth", authLimiter);
-  // Payment initiate — prevent checkout spam
-  app.use("/api/payments/initiate", paymentInitiateLimiter);
+  // Payment initiation is tRPC-only (wallet.initiateTopup) — the legacy
+  // POST /api/payments/initiate handlers were removed (audit v13, P0-5).
+  app.use("/api/trpc/wallet.initiateTopup", paymentInitiateLimiter);
+  app.use("/api/trpc/wallet.chargeToll", paymentInitiateLimiter);
   // General API — generous limit for PWA background syncs
   app.use("/api/trpc", generalApiLimiter);
 
@@ -72,16 +140,10 @@ async function startServer() {
   // WebSocket server for real-time device heartbeat streaming
   setupDeviceHeartbeatServer(server);
 
-  // Unified payment webhook — handles Paystack, Flutterwave, Interswitch
-  // Raw body capture middleware for HMAC verification
-  app.use("/api/payments", (req, _res, next) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => {
-      (req as express.Request & { rawBody?: Buffer }).rawBody = Buffer.concat(chunks);
-      next();
-    });
-  }, paymentsRouter);
+  // Unified payment webhook — handles Paystack, Flutterwave, Interswitch.
+  // req.rawBody was already stashed by the express.json({ verify }) middleware
+  // registered BEFORE the global parser above.
+  app.use("/api/payments", paymentsRouter);
 
   // Africa's Talking USSD webhook — real handset sessions from *346# shortcode
   // Raw body is captured inside ussdWebhookRouter for HMAC-SHA256 verification

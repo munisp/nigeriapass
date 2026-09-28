@@ -40,9 +40,9 @@ export function useDeviceHeartbeat(plazaId?: string) {
     if (pollRef.current) return;
     pollRef.current = setInterval(async () => {
       try {
-        const list = await deviceApi.list(plazaId);
+        const res = await deviceApi.list(plazaId);
         const map: Record<string, DeviceHeartbeat> = {};
-        for (const d of list) map[d.device_id] = d;
+        for (const d of res.data) map[d.device_id] = d;
         setState(prev => ({ ...prev, devices: map, lastUpdate: new Date(), connected: false }));
       } catch {
         // silent — keep showing last known state
@@ -123,9 +123,9 @@ export function useDeviceHeartbeat(plazaId?: string) {
     connected: state.connected,
     lastUpdate: state.lastUpdate,
     error: state.error,
-    refresh: () => deviceApi.list(plazaId).then(list => {
+    refresh: () => deviceApi.list(plazaId).then(res => {
       const map: Record<string, DeviceHeartbeat> = {};
-      for (const d of list) map[d.device_id] = d;
+      for (const d of res.data) map[d.device_id] = d;
       setState(prev => ({ ...prev, devices: map, lastUpdate: new Date() }));
     }),
   };

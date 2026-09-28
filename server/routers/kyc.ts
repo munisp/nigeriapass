@@ -15,6 +15,8 @@ import { protectedProcedure, publicProcedure, router } from "../_core/trpc";
 import { getDb } from "../db";
 import { kycApplications } from "../../drizzle/schema";
 import { eq, desc } from "drizzle-orm";
+import { createHmac, timingSafeEqual } from "crypto";
+import { ENV } from "../_core/env";
 
 // ── Reference ID generator ────────────────────────────────────────────────────
 function generateRef(prefix: string): string {
@@ -61,8 +63,149 @@ function calcVehicleScore(data: {
   return Math.min(score, 100);
 }
 
+// ── Shared per-type zod schemas (also used by sync.submitKycDraft, P1-13) ────
+
+/** Nigerian phone: +234[789]XXXXXXXXXX (E.164) or 0[789]XXXXXXXXX local. */
+export const ngPhoneSchema = z.string().regex(/^(\+234|0)[789]\d{9}$/, "Phone must be a valid Nigerian number");
+
+export const driverKycSchema = z.object({
+  fullName: z.string().min(2).max(128),
+  /** Nigerian NIN — exactly 11 digits */
+  nin: z.string().regex(/^\d{11}$/, "NIN must be exactly 11 digits"),
+  phone: ngPhoneSchema,
+  dateOfBirth: z.string().refine((v) => {
+    const dob = new Date(v);
+    if (isNaN(dob.getTime())) return false;
+    const ageMs = Date.now() - dob.getTime();
+    return ageMs >= 18 * 365.25 * 24 * 3600 * 1000; // must be ≥ 18 years old
+  }, "Driver must be at least 18 years old"),
+  address: z.string().min(5).max(256),
+  state: z.string().min(1),
+  /** Server-side liveness verification score (0–100) — fail closed, no bypass */
+  livenessScore: z.number().min(0).max(100),
+  licenseNumber: z.string().min(5).max(32).optional(),
+  uploadedDocIds: z.array(z.string()).default([]),
+});
+
+/** Minimum liveness score to accept a driver submission (fail closed). */
+export const LIVENESS_THRESHOLD = 60;
+
+export const vehicleKycSchema = z.object({
+  plateNumber: z.string().min(5).max(10),
+  make: z.string().min(2),
+  model: z.string().min(1),
+  year: z.number().int().min(1990).max(new Date().getFullYear() + 1),
+  ownerNIN: z.string().regex(/^\d{11}$/, "NIN must be exactly 11 digits"),
+  ownerPhone: ngPhoneSchema.optional(),
+  uploadedDocIds: z.array(z.string()).default([]),
+});
+
+export const fleetKycSchema = z.object({
+  companyName: z.string().min(3),
+  cacNumber: z.string().min(6),
+  tinNumber: z.string().regex(/^\d{8}$/, "TIN must be 8 digits"),
+  contactPhone: ngPhoneSchema,
+  contactEmail: z.string().email(),
+  contactNIN: z.string().regex(/^\d{11}$/, "NIN must be exactly 11 digits"),
+  uploadedDocIds: z.array(z.string()).default([]),
+});
+
+/** Dispatch helper: validate formData for a given kycType (P1-13). */
+export function validateKycFormData(
+  type: "driver" | "vehicle" | "fleet",
+  formData: Record<string, unknown>,
+): { ok: true } | { ok: false; error: string } {
+  const schema = type === "driver" ? driverKycSchema : type === "vehicle" ? vehicleKycSchema : fleetKycSchema;
+  const result = schema.safeParse(formData);
+  if (!result.success) {
+    const first = result.error.issues[0];
+    return { ok: false, error: `${first?.path.join(".") ?? "formData"}: ${first?.message ?? "invalid"}` };
+  }
+  return { ok: true };
+}
+
+function calcDriverScore(data: z.infer<typeof driverKycSchema>): number {
+  let score = 40; // base
+  if (data.nin.match(/^\d{11}$/)) score += 20;
+  if (data.livenessScore >= 80) score += 20;
+  else if (data.livenessScore >= LIVENESS_THRESHOLD) score += 10;
+  if (data.licenseNumber) score += 10;
+  if (data.uploadedDocIds.includes("drivers_license")) score += 5;
+  if (data.uploadedDocIds.includes("nin_slip")) score += 5;
+  return Math.min(score, 100);
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 export const kycRouter = router({
+
+  /**
+   * Submit a Driver KYC application (P1-12).
+   * Fully validated server-side: NIN 11-digit, NG phone, age ≥ 18, and a
+   * liveness score that must meet the threshold — fail closed, no bypass.
+   */
+  submitDriver: protectedProcedure
+    .input(driverKycSchema)
+    .mutation(async ({ input, ctx }) => {
+      if (input.livenessScore < LIVENESS_THRESHOLD) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: `Liveness verification failed (score ${input.livenessScore} < ${LIVENESS_THRESHOLD}). Please redo the selfie check.`,
+        });
+      }
+
+      const db = await getDb();
+      if (!db) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Database unavailable. Please try again shortly.",
+        });
+      }
+
+      const referenceId = generateRef("DRV");
+      const kycScore = calcDriverScore(input);
+
+      const formData = {
+        full_name: input.fullName,
+        nin: input.nin,
+        phone: input.phone,
+        date_of_birth: input.dateOfBirth,
+        address: input.address,
+        state: input.state,
+        liveness_score: input.livenessScore,
+        license_number: input.licenseNumber ?? null,
+        uploaded_docs: input.uploadedDocIds,
+      };
+
+      try {
+        const [inserted] = await db
+          .insert(kycApplications)
+          .values({
+            referenceId,
+            userId: ctx.user.id,
+            type: "driver",
+            status: "submitted",
+            formData,
+            kycScore,
+            fromOfflineQueue: false,
+            clientVersion: 1,
+          })
+          .returning({ id: kycApplications.id, referenceId: kycApplications.referenceId });
+
+        console.log(`[KYC] Driver KYC submitted: ${inserted.referenceId} by user ${ctx.user.id}`);
+
+        return {
+          referenceId: inserted.referenceId,
+          status: "submitted" as const,
+          kycScore,
+          message: "Driver KYC application submitted successfully",
+        };
+      } catch (err) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: `Failed to submit Driver KYC: ${(err as Error).message}`,
+        });
+      }
+    }),
 
   /**
    * Submit a Fleet KYB application.
@@ -274,12 +417,23 @@ export const kycRouter = router({
     }),
 
   /**
-   * Get the status of a single application by reference ID.
-   * Public — no auth required (used by the /status/:refId page).
+   * Get the status of a single application by reference ID (P1-15).
+   *
+   * Access control:
+   *  - Authenticated users may query their OWN applications.
+   *  - Admin/reviewer roles may query any application.
+   *  - Anonymous callers must present a signed status token
+   *    (HMAC-SHA256(cookieSecret, referenceId)) — e.g. printed on a receipt.
+   *
+   * reviewNotes and kycScore are only visible to the owner or staff —
+   * never leaked to anonymous callers.
    */
   getApplicationStatus: publicProcedure
-    .input(z.object({ referenceId: z.string().min(1) }))
-    .query(async ({ input }) => {
+    .input(z.object({
+      referenceId: z.string().min(1),
+      statusToken: z.string().optional(),
+    }))
+    .query(async ({ input, ctx }) => {
       const db = await getDb();
       if (!db) return null;
 
@@ -287,6 +441,7 @@ export const kycRouter = router({
         const [app] = await db
           .select({
             referenceId: kycApplications.referenceId,
+            userId: kycApplications.userId,
             type: kycApplications.type,
             status: kycApplications.status,
             kycScore: kycApplications.kycScore,
@@ -298,8 +453,44 @@ export const kycRouter = router({
           .where(eq(kycApplications.referenceId, input.referenceId))
           .limit(1);
 
-        return app ?? null;
+        if (!app) return null;
+
+        const role = ctx.user?.role;
+        const isStaff = role === "admin" || role === "reviewer" || role === "support";
+        const isOwner = !!ctx.user && app.userId === ctx.user.id;
+
+        // Signed status token path for anonymous status checks
+        let hasValidToken = false;
+        if (!isStaff && !isOwner && input.statusToken) {
+          const expected = createHmac("sha256", ENV.cookieSecret || "nigerianpass-status")
+            .update(`kyc-status:${input.referenceId}`)
+            .digest("hex")
+            .slice(0, 32);
+          hasValidToken = timingSafeEqual(
+            Buffer.from(input.statusToken.padEnd(32).slice(0, 32)),
+            Buffer.from(expected),
+          );
+        }
+
+        if (!isStaff && !isOwner && !hasValidToken) {
+          throw new TRPCError({
+            code: "UNAUTHORIZED",
+            message: "Sign in or provide a valid status token to view this application.",
+          });
+        }
+
+        return {
+          referenceId: app.referenceId,
+          type: app.type,
+          status: app.status,
+          createdAt: app.createdAt,
+          updatedAt: app.updatedAt,
+          // Sensitive fields only for owner/staff (P1-15)
+          kycScore: isStaff || isOwner ? app.kycScore : null,
+          reviewNotes: isStaff || isOwner ? app.reviewNotes : null,
+        };
       } catch (err) {
+        if (err instanceof TRPCError) throw err;
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
           message: `Failed to load application status: ${(err as Error).message}`,

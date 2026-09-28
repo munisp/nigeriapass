@@ -57,12 +57,29 @@ export interface KycDraftSyncResult {
 export interface UseKycDraftSyncReturn {
   /** Submit the KYC draft immediately if online, or queue it for later. */
   submitOrQueue: (payload: KycDraftPayload) => Promise<{ queued: boolean; result?: KycDraftSyncResult }>;
+  /** Persist a draft to the IndexedDB retry queue without attempting submission. */
+  queueDraft: (payload: KycDraftPayload) => Promise<void>;
   /** Number of KYC draft items currently pending in the retry queue. */
   queuedDraftCount: number;
   /** True while a background replay of queued drafts is in progress. */
   isReplaying: boolean;
   /** Manually trigger a replay of all pending KYC drafts (e.g. after manual reconnect). */
   triggerReplay: () => Promise<void>;
+}
+
+/**
+ * True when a tRPC mutation failed because the server could not be reached
+ * (offline / DNS / connection reset) rather than responding with an error.
+ * Server-side validation errors carry a `data.code` and must NOT be queued —
+ * queueing them would just fail again on replay.
+ */
+export function isNetworkError(err: unknown): boolean {
+  if (typeof navigator !== "undefined" && !navigator.onLine) return true;
+  // TRPCClientError without a parsed `data` envelope means no valid server response
+  if (err instanceof Error && err.name === "TRPCClientError") {
+    return (err as { data?: unknown }).data == null;
+  }
+  return err instanceof TypeError; // fetch "Failed to fetch"
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -232,8 +249,28 @@ export function useKycDraftSync(): UseKycDraftSyncReturn {
     [submitMutation, refreshQueueCount]
   );
 
+  // ── Queue without submitting (offline / network-failure fallback) ─────────
+  const queueDraft = useCallback(
+    async (payload: KycDraftPayload): Promise<void> => {
+      await enqueueRetry({
+        url: "/api/trpc/sync.submitKycDraft",
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        label: buildQueueLabel(payload.type),
+        maxAttempts: MAX_REPLAY_ATTEMPTS,
+      });
+      await refreshQueueCount();
+      toast.info("KYC draft saved for later", {
+        description: "Your application will be submitted automatically when you reconnect.",
+      });
+    },
+    [refreshQueueCount]
+  );
+
   return {
     submitOrQueue,
+    queueDraft,
     queuedDraftCount,
     isReplaying,
     triggerReplay,

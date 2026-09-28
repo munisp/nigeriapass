@@ -12,6 +12,7 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { FlutterwaveProvider } from "./payments/gateway";
+import { parsePaymentReference } from "./payments/reference";
 
 // ── Helper: build a Flutterwave charge.completed payload ──────────────────────
 function buildChargePayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -184,24 +185,31 @@ describe("FlutterwaveProvider.parseWebhook", () => {
   });
 });
 
-describe("FlutterwaveProvider reference format", () => {
-  it("reference matches nigerianpass_<userId>_<timestamp> pattern", () => {
-    const ref = "nigerianpass_42_1700000000000";
-    const match = ref.match(/^nigerianpass_(\d+)_/);
-    expect(match).not.toBeNull();
-    expect(match![1]).toBe("42");
+describe("Unified payment reference format (audit v13, P0-4)", () => {
+  it("canonical NP-<PROVIDER>-<userId>-<ts> parses via the shared helper", () => {
+    const ref = "NP-FLUTTERWAVE-42-1700000000000-ABC123";
+    const parsed = parsePaymentReference(ref);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.provider).toBe("flutterwave");
+    expect(parsed!.userId).toBe(42);
+    expect(parsed!.legacy).toBe(false);
   });
 
-  it("extracts userId from reference correctly", () => {
-    const ref = "nigerianpass_999_1700000099999";
-    const match = ref.match(/^nigerianpass_(\d+)_/);
-    const userId = match ? parseInt(match[1], 10) : null;
-    expect(userId).toBe(999);
+  it("legacy nigerianpass_<userId>_<ts> is still recognised (read-only)", () => {
+    const parsed = parsePaymentReference("nigerianpass_999_1700000099999");
+    expect(parsed).not.toBeNull();
+    expect(parsed!.userId).toBe(999);
+    expect(parsed!.legacy).toBe(true);
   });
 
-  it("returns null for non-nigerianpass references", () => {
-    const ref = "FLW-external-ref-123";
-    const match = ref.match(/^nigerianpass_(\d+)_/);
-    expect(match).toBeNull();
+  it("legacy NP-TOPUP-<userId>-<ts> is still recognised (read-only)", () => {
+    const parsed = parsePaymentReference("NP-TOPUP-7-1700000000000");
+    expect(parsed).not.toBeNull();
+    expect(parsed!.userId).toBe(7);
+    expect(parsed!.legacy).toBe(true);
+  });
+
+  it("returns null for non-NigerianPass references", () => {
+    expect(parsePaymentReference("FLW-external-ref-123")).toBeNull();
   });
 });

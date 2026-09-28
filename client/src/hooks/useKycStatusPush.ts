@@ -1,15 +1,20 @@
 /**
  * useKycStatusPush — per-application WebSocket subscription
  *
- * Connects to  ws://<host>/ws/status/<applicationId>?token=<jwt>
- * and streams live KYC/KYB status events.
+ * Connects to the server WebSocket endpoint at /ws/kyc and subscribes to
+ * status events for one application reference ID:
  *
- * Falls back to HTTP polling every 15 s when WebSocket is unavailable.
- * In demo mode (no backend) it simulates a status progression after 8 s.
+ *   Client → Server: { type: "subscribe",   referenceId }
+ *   Client → Server: { type: "unsubscribe", referenceId }
+ *   Server → Client: { type: "kyc_status_changed", referenceId, newStatus,
+ *                      reviewNotes, kycScore, reviewedAt, reviewedBy }
+ *   Server → Client: { type: "ping" }  (30 s keepalive — answered with "pong")
+ *
+ * There is no simulated/demo progression: when the socket cannot connect the
+ * hook simply reports isConnected=false so the UI can show an honest
+ * "live updates unavailable" state.
  */
 import { useState, useEffect, useRef, useCallback } from "react";
-import { WS_BASE, onboardingClient } from "@/lib/api";
-import { tokenStore } from "@/lib/api";
 
 export type KycStatus = "pending" | "under_review" | "approved" | "rejected";
 
@@ -27,44 +32,70 @@ interface UseKycStatusPushReturn {
   latestEvent: KycStatusEvent | null;
   history: KycStatusEvent[];
   isConnected: boolean;
+  /** Kept for UI compatibility — always false (no polling fallback). */
   isPolling: boolean;
   lastUpdated: Date | null;
 }
 
-// ── Demo simulation ───────────────────────────────────────────────────────────
-const DEMO_PROGRESSION: Record<string, KycStatusEvent[]> = {
-  "DRV-XKQP7": [
-    {
-      application_id: "DRV-XKQP7",
-      status: "under_review",
-      step_label: "Admin Review Started",
-      step_description: "Compliance officer Adaeze Nwosu has opened your application for review.",
-      timestamp: new Date().toISOString(),
-      kyc_score: 87,
-    },
-    {
-      application_id: "DRV-XKQP7",
-      status: "approved",
-      step_label: "KYC Approved",
-      step_description: "Your identity has been verified. NigerianPass account is now active.",
-      timestamp: new Date(Date.now() + 8000).toISOString(),
-      notes: "All documents verified. NFC tag will be issued within 24 hours.",
-      kyc_score: 91,
-    },
-  ],
+// ── Server event shape (mirrors server/events/kycEvents.ts) ──────────────────
+type ServerStatus =
+  | "submitted"
+  | "under_review"
+  | "approved"
+  | "rejected"
+  | "requires_resubmission";
+
+interface ServerKycStatusEvent {
+  type: "kyc_status_changed";
+  referenceId: string;
+  newStatus: ServerStatus;
+  reviewNotes: string | null;
+  kycScore: number | null;
+  reviewedAt: number;
+  reviewedBy?: string;
+}
+
+const STATUS_MAP: Record<ServerStatus, { status: KycStatus; label: string; description: string }> = {
+  submitted: {
+    status: "pending",
+    label: "Application Submitted",
+    description: "Your application has been received and is awaiting review.",
+  },
+  under_review: {
+    status: "under_review",
+    label: "Admin Review",
+    description: "A compliance officer is reviewing your application.",
+  },
+  approved: {
+    status: "approved",
+    label: "KYC Approved",
+    description: "Your identity has been verified. Your NigerianPass account is now active.",
+  },
+  rejected: {
+    status: "rejected",
+    label: "KYC Rejected",
+    description: "Your application was rejected. See the review notes for details.",
+  },
+  requires_resubmission: {
+    status: "rejected",
+    label: "Resubmission Required",
+    description: "The review team requested changes. Please resubmit with corrected details.",
+  },
 };
+
+function wsUrl(): string {
+  const proto = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${proto}://${window.location.host}/ws/kyc`;
+}
 
 export function useKycStatusPush(applicationId: string | undefined): UseKycStatusPushReturn {
   const [latestEvent, setLatestEvent] = useState<KycStatusEvent | null>(null);
   const [history, setHistory] = useState<KycStatusEvent[]>([]);
   const [isConnected, setIsConnected] = useState(false);
-  const [isPolling, setIsPolling] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
-  const demoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttempts = useRef(0);
   const MAX_RECONNECT = 4;
 
@@ -74,69 +105,37 @@ export function useKycStatusPush(applicationId: string | undefined): UseKycStatu
     setLastUpdated(new Date());
   }, []);
 
-  // ── HTTP poll fallback ────────────────────────────────────────────────────
-  const pollStatus = useCallback(async () => {
-    if (!applicationId) return;
-    try {
-      const res = await onboardingClient.get<KycStatusEvent>(`/applications/${applicationId}/status`);
-      pushEvent(res.data);
-    } catch {
-      // Backend unavailable — keep existing state
-    }
-  }, [applicationId, pushEvent]);
-
-  const startPolling = useCallback(() => {
-    if (pollTimer.current) return;
-    setIsPolling(true);
-    pollStatus();
-    pollTimer.current = setInterval(pollStatus, 15_000);
-  }, [pollStatus]);
-
-  // ── Demo simulation ───────────────────────────────────────────────────────
-  const runDemoSimulation = useCallback(() => {
-    if (!applicationId) return;
-    const events = DEMO_PROGRESSION[applicationId.toUpperCase()];
-    if (!events) return;
-
-    let delay = 0;
-    events.forEach(evt => {
-      demoTimer.current = setTimeout(() => {
-        pushEvent(evt);
-      }, delay);
-      delay += 8000; // 8 s between each simulated event
-    });
-  }, [applicationId, pushEvent]);
-
   // ── WebSocket connection ──────────────────────────────────────────────────
   const connectWS = useCallback(() => {
     if (!applicationId) return;
-    const token = tokenStore.get();
-    if (!token) {
-      // Not authenticated — run demo simulation
-      runDemoSimulation();
-      return;
-    }
 
     try {
-      const url = `${WS_BASE}/ws/status/${applicationId}?token=${encodeURIComponent(token)}`;
-      const ws = new WebSocket(url);
+      const ws = new WebSocket(wsUrl());
       wsRef.current = ws;
 
       ws.onopen = () => {
         reconnectAttempts.current = 0;
         setIsConnected(true);
-        setIsPolling(false);
-        if (pollTimer.current) {
-          clearInterval(pollTimer.current);
-          pollTimer.current = null;
-        }
+        ws.send(JSON.stringify({ type: "subscribe", referenceId: applicationId }));
       };
 
       ws.onmessage = (evt) => {
         try {
-          const msg = JSON.parse(evt.data) as { type: string; event?: KycStatusEvent };
-          if (msg.type === "status_update" && msg.event) {
-            pushEvent(msg.event);
+          const msg = JSON.parse(evt.data) as { type: string };
+          if (msg.type === "kyc_status_changed") {
+            const e = msg as unknown as ServerKycStatusEvent;
+            if (e.referenceId !== applicationId) return;
+            const mapped = STATUS_MAP[e.newStatus];
+            if (!mapped) return;
+            pushEvent({
+              application_id: e.referenceId,
+              status: mapped.status,
+              step_label: mapped.label,
+              step_description: e.reviewNotes ?? mapped.description,
+              timestamp: new Date(e.reviewedAt || Date.now()).toISOString(),
+              notes: e.reviewNotes ?? undefined,
+              kyc_score: e.kycScore ?? undefined,
+            });
           } else if (msg.type === "ping") {
             ws.send(JSON.stringify({ type: "pong" }));
           }
@@ -150,31 +149,30 @@ export function useKycStatusPush(applicationId: string | undefined): UseKycStatu
           const delay = Math.min(1000 * 2 ** reconnectAttempts.current, 30_000);
           reconnectAttempts.current++;
           reconnectTimer.current = setTimeout(connectWS, delay);
-        } else {
-          // Fall back to polling + demo
-          startPolling();
-          runDemoSimulation();
         }
+        // After MAX_RECONNECT attempts we stay disconnected — the UI shows
+        // an honest "live updates unavailable" state; no fake data.
       };
 
       ws.onerror = () => ws.close();
     } catch {
-      startPolling();
-      runDemoSimulation();
+      setIsConnected(false);
     }
-  }, [applicationId, pushEvent, runDemoSimulation, startPolling]);
+  }, [applicationId, pushEvent]);
 
   // ── Mount / unmount ───────────────────────────────────────────────────────
   useEffect(() => {
     if (!applicationId) return;
     connectWS();
     return () => {
-      wsRef.current?.close();
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ type: "unsubscribe", referenceId: applicationId })); } catch { /* ignore */ }
+      }
+      ws?.close();
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
-      if (pollTimer.current) clearInterval(pollTimer.current);
-      if (demoTimer.current) clearTimeout(demoTimer.current);
     };
   }, [applicationId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  return { latestEvent, history, isConnected, isPolling, lastUpdated };
+  return { latestEvent, history, isConnected, isPolling: false, lastUpdated };
 }

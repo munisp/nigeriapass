@@ -65,23 +65,32 @@ export function usePushNotifications(): UsePushNotificationsReturn {
       setPermission(result as PushPermission);
 
       if (result === "granted") {
-        // Try to subscribe via Push API
+        // Subscribe via Push API only when a real VAPID public key is configured
+        const vapidKey = import.meta.env.VITE_VAPID_PUBLIC_KEY as string | undefined;
         const reg = await registerSW();
-        if (reg && "pushManager" in reg) {
+        if (reg && "pushManager" in reg && vapidKey) {
           try {
-            // In production, replace with real VAPID public key
-            const VAPID_PUBLIC_KEY = "BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3qBUYIHBQFLXYp5Nksh8U";
-            const sub = await reg.pushManager.subscribe({
+            await reg.pushManager.subscribe({
               userVisibleOnly: true,
-              applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY).buffer as ArrayBuffer,
+              applicationServerKey: urlBase64ToUint8Array(vapidKey).buffer as ArrayBuffer,
             });
-            console.log("Push subscription:", JSON.stringify(sub));
-          } catch {
-            // VAPID key mismatch in demo — subscription still "granted" locally
+            setIsSubscribed(true);
+            localStorage.setItem(STORAGE_KEY, "true");
+          } catch (err) {
+            // Push service unreachable or key rejected — permission stays granted
+            // for local notifications, but we do not claim a push subscription.
+            console.warn("Push subscription failed:", err);
+            setIsSubscribed(false);
+            localStorage.removeItem(STORAGE_KEY);
           }
+        } else {
+          // No VAPID key configured (or no push manager) — local notifications only
+          if (!vapidKey) {
+            console.info("VITE_VAPID_PUBLIC_KEY not set — push subscription skipped, local notifications only.");
+          }
+          setIsSubscribed(false);
+          localStorage.removeItem(STORAGE_KEY);
         }
-        setIsSubscribed(true);
-        localStorage.setItem(STORAGE_KEY, "true");
 
         // Send a welcome notification
         new Notification("NigerianPass Alerts Enabled", {
@@ -99,7 +108,7 @@ export function usePushNotifications(): UsePushNotificationsReturn {
   const sendTestNotification = useCallback(() => {
     if (permission !== "granted") return;
     new Notification("NigerianPass Test Alert", {
-      body: "Your KYC application DRV-XKQP7 has been approved! ✅",
+      body: "This is a test notification from your device — no account data was used.",
       icon: "/icons/icon-192.png",
       badge: "/icons/icon-72.png",
       tag: "np-test",

@@ -1,0 +1,20 @@
+# open-appsec local policy (used when OPENAPPSEC_TOKEN is unset and the agent
+# runs disconnected from the SaaS portal).
+# Modes: start in detect-learn, graduate to prevent once false-positive rate
+# on /api/trpc and /api/webhooks is verified low.
+policies:
+  default:
+    mode: detect-learn
+    practices:
+      - IPS
+      - Snort
+      - WebAttacks
+    triggers:
+      - log-to-agent
+  webhooks:
+    # Payment webhooks carry opaque provider payloads; keep them in detect
+    # longer — a false block here loses real money events.
+    mode: detect-learn
+    rules:
+      - path-prefix: /api/webhooks
+exceptions: []

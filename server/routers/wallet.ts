@@ -17,7 +17,8 @@ import { protectedProcedure, router } from "../_core/trpc";
 import { getDb } from "../db";
 import { walletAccounts, walletTransactions } from "../../drizzle/schema";
 import { eq, desc, and, gte, sql } from "drizzle-orm";
-import { getOrCreateWalletAccount, getWalletTransactions } from "../db";
+import { getOrCreateWalletAccount, getWalletTransactions, creditWalletAtomic, debitWalletAtomic } from "../db";
+import { writeAuditLog } from "../_core/audit";
 import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
 import { createHmac } from "crypto";
 import { ENV } from "../_core/env";
@@ -408,9 +409,11 @@ export const walletRouter = router({
       const callbackUrl = input.callbackUrl ?? `${ENV.oAuthServerUrl?.replace("/api/oauth", "") ?? "https://nigerianpass.ng"}/wallet?status=success`;
 
       // Use the existing payment gateway
-      const { getProvider, getProviderSecretKey } = await import("../payments/gateway");
+      const { getProvider } = await import("../payments/gateway");
+      const { buildPaymentReference } = await import("../payments/reference");
       const provider = getProvider(input.provider);
-      const reference = `NP-TOPUP-${ctx.user.id}-${Date.now()}`;
+      // Unified reference format: NP-<PROVIDER>-<userId>-<ts>-<rand> (P0-4)
+      const reference = buildPaymentReference(input.provider, ctx.user.id);
       const result = await provider.initiateTopUp({
         reference,
         amountKobo,
@@ -467,24 +470,101 @@ export const walletRouter = router({
         return { status: "failed", amountKobo: 0, reference: input.reference };
       }
 
-      // Credit the wallet
+      // Credit the wallet atomically + idempotently (P0-4): the
+      // UNIQUE(external_ref) constraint + ON CONFLICT DO NOTHING guard makes
+      // double-crediting impossible even under concurrent requests.
       const wallet = await getOrCreateWalletAccount(ctx.user.id);
-      await db.update(walletAccounts)
-        .set({
-          balanceKobo: sql`${walletAccounts.balanceKobo} + ${event.amountKobo}`,
-          updatedAt: new Date(),
-        })
-        .where(eq(walletAccounts.id, wallet.id));
-
-      await db.insert(walletTransactions).values({
-        walletId: wallet.id,
-        type: "topup",
+      const outcome = await creditWalletAtomic({
+        userId: ctx.user.id,
         amountKobo: event.amountKobo,
-        balanceAfterKobo: (wallet.balanceKobo ?? 0) + event.amountKobo,
-        description: `Wallet top-up via ${input.provider.charAt(0).toUpperCase() + input.provider.slice(1)}`,
         externalRef: input.reference,
+        type: "topup",
+        description: `Wallet top-up via ${input.provider.charAt(0).toUpperCase() + input.provider.slice(1)}`,
+      });
+
+      if (outcome.status === "duplicate") {
+        return { status: "already_credited", amountKobo: event.amountKobo, reference: input.reference };
+      }
+      if (outcome.status !== "credited") {
+        throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Failed to credit wallet" });
+      }
+
+      void writeAuditLog({
+        actorUserId: ctx.user.id,
+        action: "wallet.credit",
+        entity: "wallet",
+        entityId: String(wallet.id),
+        diff: { amountKobo: event.amountKobo, reference: input.reference, provider: input.provider, source: "verifyTopup" },
       });
 
       return { status: "credited", amountKobo: event.amountKobo, reference: input.reference };
+    }),
+
+  /**
+   * Debit the wallet for a toll charge (P1-22).
+   * Atomic balance check + decrement inside a DB transaction, idempotent on
+   * idempotencyKey, enforces the daily fare cap, and emits a low-balance
+   * notification hook when the remaining balance drops below ₦500.
+   */
+  chargeToll: protectedProcedure
+    .input(z.object({
+      amountKobo: z.number().int().min(1).max(10_000_000),
+      plazaId: z.string().min(1).max(32),
+      /** Client-generated idempotency key — replays never double-debit */
+      idempotencyKey: z.string().min(8).max(128),
+      description: z.string().max(256).optional(),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      const db = await getDb();
+      if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database unavailable" });
+
+      const externalRef = `NP-TOLL-${ctx.user.id}-${input.idempotencyKey}`;
+      const outcome = await debitWalletAtomic({
+        userId: ctx.user.id,
+        amountKobo: input.amountKobo,
+        externalRef,
+        plazaId: input.plazaId,
+        description: input.description ?? `Toll charge at plaza ${input.plazaId}`,
+      });
+
+      switch (outcome.status) {
+        case "duplicate":
+          return { status: "duplicate" as const, reference: externalRef };
+        case "no_wallet":
+          throw new TRPCError({ code: "NOT_FOUND", message: "Wallet not found" });
+        case "insufficient_funds":
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Insufficient wallet balance" });
+        case "daily_cap_exceeded":
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: `Daily fare cap exceeded (cap ₦${outcome.dailyCapKobo / 100}, spent ₦${outcome.dailySpentKobo / 100})`,
+          });
+      }
+
+      // Low-balance notification hook (< ₦500 remaining)
+      if (outcome.newBalanceKobo < 50_000) {
+        try {
+          const { notifyOwner } = await import("../_core/notification");
+          void notifyOwner({
+            title: "Low wallet balance after toll charge",
+            content: `User ${ctx.user.id} balance is ₦${(outcome.newBalanceKobo / 100).toFixed(2)} after toll charge ${externalRef}`,
+          }).catch(() => {});
+        } catch { /* non-fatal */ }
+      }
+
+      void writeAuditLog({
+        actorUserId: ctx.user.id,
+        action: "wallet.toll_charge",
+        entity: "wallet",
+        entityId: String(outcome.walletId),
+        diff: { amountKobo: input.amountKobo, plazaId: input.plazaId, reference: externalRef, newBalanceKobo: outcome.newBalanceKobo },
+      });
+
+      return {
+        status: "debited" as const,
+        reference: externalRef,
+        transactionId: outcome.transactionId,
+        newBalanceKobo: outcome.newBalanceKobo,
+      };
     }),
 });

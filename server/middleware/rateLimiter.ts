@@ -11,8 +11,73 @@
  * IPv6 note: all keyGenerators use ipKeyGenerator() to normalise IPv6
  * addresses and prevent bypass via address rotation.
  */
-import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import rateLimit, { ipKeyGenerator, type Store } from "express-rate-limit";
 import type { Request, Response } from "express";
+
+// ── Store abstraction (P1-21) ────────────────────────────────────────────────
+// Rate-limit state defaults to the in-process memory store. When REDIS_URL is
+// configured, a Redis-backed store is plugged in so limits are shared across
+// instances. The Redis client lives in server/integrations/redis.ts (owned by
+// another agent); we load it defensively via dynamic import and fall back to
+// memory if it is absent or fails.
+
+let _redisStore: Store | null | undefined; // undefined = not attempted yet
+
+async function getRedisStore(): Promise<Store | null> {
+  if (_redisStore !== undefined) return _redisStore;
+  _redisStore = null;
+  if (!process.env.REDIS_URL) return _redisStore;
+  try {
+    const mod = await import("../integrations/redis");
+    const createStore = (mod as Record<string, unknown>).createRateLimitStore as
+      | ((opts?: { prefix?: string }) => Store)
+      | undefined;
+    if (typeof createStore === "function") {
+      _redisStore = createStore({ prefix: "rl" });
+      console.log("[RateLimit] Using Redis store");
+    }
+  } catch (err) {
+    console.warn("[RateLimit] Redis store unavailable, falling back to memory:", (err as Error).message);
+    _redisStore = null;
+  }
+  return _redisStore;
+}
+
+/** Trigger async store resolution at module load; limiters use it lazily. */
+const storePromise = getRedisStore();
+
+/** Single shared memory fallback store (used until/unless Redis resolves). */
+let _memoryFallback: Store | null = null;
+function memoryFallback(): Store {
+  if (!_memoryFallback) {
+    // express-rate-limit's default MemoryStore
+    _memoryFallback = new (rateLimit as unknown as { MemoryStore: new () => Store }).MemoryStore();
+  }
+  return _memoryFallback;
+}
+
+/** Store proxy that defers to the Redis store once resolved, else memory. */
+function deferredStore(): Store | undefined {
+  if (!process.env.REDIS_URL) return undefined; // express-rate-limit memory default
+  return {
+    async increment(key: string) {
+      const store = (_redisStore ?? (await storePromise)) ?? memoryFallback();
+      return store.increment(key);
+    },
+    async decrement(key: string) {
+      const store = (_redisStore ?? (await storePromise)) ?? memoryFallback();
+      return store.decrement?.(key);
+    },
+    async resetKey(key: string) {
+      const store = (_redisStore ?? (await storePromise)) ?? memoryFallback();
+      return store.resetKey(key);
+    },
+    async resetAll() {
+      const store = (_redisStore ?? (await storePromise)) ?? memoryFallback();
+      return store.resetAll?.();
+    },
+  } as Store;
+}
 
 /** Human-readable JSON error response for rate-limit hits */
 const rateLimitHandler = (req: Request, res: Response) => {
@@ -34,6 +99,7 @@ export const otpSendLimiter = rateLimit({
   legacyHeaders: false,
   message: undefined,
   handler: rateLimitHandler,
+  store: deferredStore(),
   keyGenerator: (req) => {
     // Key on normalised IP + phone number to prevent per-number abuse across IPs.
     const body = req.body as { phone?: string; json?: { phone?: string } };
@@ -51,6 +117,7 @@ export const otpVerifyLimiter = rateLimit({
   legacyHeaders: false,
   message: undefined,
   handler: rateLimitHandler,
+  store: deferredStore(),
   keyGenerator: ipKey,
   skip: () => process.env.NODE_ENV === "test",
 });
@@ -63,6 +130,7 @@ export const paymentInitiateLimiter = rateLimit({
   legacyHeaders: false,
   message: undefined,
   handler: rateLimitHandler,
+  store: deferredStore(),
   keyGenerator: ipKey,
   skip: () => process.env.NODE_ENV === "test",
 });
@@ -75,6 +143,7 @@ export const authLimiter = rateLimit({
   legacyHeaders: false,
   message: undefined,
   handler: rateLimitHandler,
+  store: deferredStore(),
   keyGenerator: ipKey,
   skip: () => process.env.NODE_ENV === "test",
 });
@@ -87,6 +156,7 @@ export const generalApiLimiter = rateLimit({
   legacyHeaders: false,
   message: undefined,
   handler: rateLimitHandler,
+  store: deferredStore(),
   keyGenerator: ipKey,
   skip: () => process.env.NODE_ENV === "test",
 });

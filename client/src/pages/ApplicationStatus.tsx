@@ -103,7 +103,7 @@ function LivePushBanner({
         ) : (
           <>
             <WifiOff className="w-3 h-3 text-muted-foreground" />
-            <span className="text-muted-foreground">Connecting to live updates…</span>
+            <span className="text-muted-foreground">Live updates unavailable — the status below is the latest fetched from the server. Refresh to retry.</span>
           </>
         )}
       </div>

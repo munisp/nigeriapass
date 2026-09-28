@@ -27,6 +27,18 @@
 import crypto from "crypto";
 import { ENV } from "../_core/env.js";
 
+/**
+ * Fail closed: a provider secret must be configured. There are NO demo
+ * fallbacks — calling a payment provider with a fabricated key is a
+ * security defect (see audit v13, P0-2).
+ */
+function requireSecret(value: string, name: string): string {
+  if (!value || /demo/i.test(value)) {
+    throw new Error(`[Payments] ${name} is not configured. Set the ${name} environment variable with a real provider secret.`);
+  }
+  return value;
+}
+
 // ── Core Types ────────────────────────────────────────────────────────────────
 
 export type PaymentProviderSlug = "paystack" | "flutterwave" | "interswitch";
@@ -130,7 +142,7 @@ class PaystackProvider implements PaymentProvider {
   readonly maxAmountKobo = 100000000; // ₦1,000,000
 
   async initiateTopUp(params: InitiateTopUpParams): Promise<InitiateTopUpResult> {
-    const secretKey = ENV.paystackSecretKey || "sk_test_demo_key";
+    const secretKey = requireSecret(ENV.paystackSecretKey, "PAYSTACK_SECRET_KEY");
     const response = await fetch("https://api.paystack.co/transaction/initialize", {
       method: "POST",
       headers: {
@@ -251,7 +263,7 @@ export class FlutterwaveProvider implements PaymentProvider {
   readonly maxAmountKobo = 500000000; // ₦5,000,000
 
   async initiateTopUp(params: InitiateTopUpParams): Promise<InitiateTopUpResult> {
-    const secretKey = ENV.flutterwaveSecretKey || "FLWSECK_TEST-demo_key";
+    const secretKey = requireSecret(ENV.flutterwaveSecretKey, "FLUTTERWAVE_SECRET_KEY");
     const response = await fetch("https://api.flutterwave.com/v3/payments", {
       method: "POST",
       headers: {
@@ -376,7 +388,7 @@ class InterswitchProvider implements PaymentProvider {
 
   async initiateTopUp(params: InitiateTopUpParams): Promise<InitiateTopUpResult> {
     // Interswitch Quickteller Web SDK checkout
-    const clientId = ENV.interswitchClientId || "IKIA_demo";
+    const clientId = requireSecret(ENV.interswitchClientId, "INTERSWITCH_CLIENT_ID");
     const baseUrl = ENV.interswitchBaseUrl || "https://sandbox.interswitchng.com";
 
     const response = await fetch(`${baseUrl}/api/v2/quickteller/payments/initiate`, {
@@ -388,7 +400,7 @@ class InterswitchProvider implements PaymentProvider {
         Nonce: params.reference,
         "Signature-Method": "SHA512",
         Signature: crypto
-          .createHmac("sha512", ENV.interswitchClientSecret || "demo_secret")
+          .createHmac("sha512", requireSecret(ENV.interswitchClientSecret, "INTERSWITCH_CLIENT_SECRET"))
           .update(`${clientId}${Math.floor(Date.now() / 1000)}${params.reference}`)
           .digest("base64"),
       },
@@ -469,7 +481,7 @@ class InterswitchProvider implements PaymentProvider {
 
   async verifyTransaction(reference: string, secretKey: string): Promise<VerifyTransactionResult> {
     const baseUrl = process.env.INTERSWITCH_BASE_URL ?? "https://sandbox.interswitchng.com";
-    const clientId = process.env.INTERSWITCH_CLIENT_ID ?? "IKIA_demo";
+    const clientId = requireSecret(ENV.interswitchClientId, "INTERSWITCH_CLIENT_ID");
     const timestamp = String(Math.floor(Date.now() / 1000));
     const nonce = crypto.randomBytes(16).toString("hex");
 
@@ -554,11 +566,62 @@ export function listProviders(): Array<{
 /**
  * Get the secret key for a provider from environment variables.
  */
+/**
+ * Request a refund from the provider for a previously settled transaction.
+ * Returns the provider-side refund reference. Throws on provider errors.
+ */
+export async function requestProviderRefund(
+  slug: PaymentProviderSlug,
+  paymentReference: string,
+  amountKobo: number,
+): Promise<{ providerRef: string }> {
+  const secretKey = getProviderSecretKey(slug);
+  switch (slug) {
+    case "paystack": {
+      const res = await fetch("https://api.paystack.co/refund", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${secretKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ transaction: paymentReference, amount: amountKobo }),
+      });
+      if (!res.ok) throw new Error(`Paystack refund failed: ${res.status} ${await res.text()}`);
+      const data = await res.json() as { data?: { id?: number } };
+      return { providerRef: `paystack-refund-${data.data?.id ?? Date.now()}` };
+    }
+    case "flutterwave": {
+      // Flutterwave refunds require the transaction id; look it up by reference first.
+      const verify = await getProvider("flutterwave").verifyTransaction(paymentReference, secretKey);
+      const res = await fetch(`https://api.flutterwave.com/v3/transactions/${encodeURIComponent(verify.providerReference)}/refund`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${secretKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ amount: amountKobo / 100 }),
+      });
+      if (!res.ok) throw new Error(`Flutterwave refund failed: ${res.status} ${await res.text()}`);
+      return { providerRef: `flutterwave-refund-${Date.now()}` };
+    }
+    case "interswitch": {
+      const baseUrl = ENV.interswitchBaseUrl;
+      const res = await fetch(`${baseUrl}/api/v2/quickteller/payments/refund`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transactionReference: paymentReference, amount: amountKobo }),
+      });
+      if (!res.ok) throw new Error(`Interswitch refund failed: ${res.status} ${await res.text()}`);
+      return { providerRef: `interswitch-refund-${Date.now()}` };
+    }
+  }
+}
+
+/**
+ * Get the secret key for a provider from environment variables.
+ * Throws when the secret is not configured — never returns a demo value.
+ */
 export function getProviderSecretKey(slug: PaymentProviderSlug): string {
-  const keyMap: Record<PaymentProviderSlug, string> = {
-    paystack: ENV.paystackSecretKey || "sk_test_demo_nigerianpass",
-    flutterwave: ENV.flutterwaveSecretKey || "FLWSECK_TEST-demo_nigerianpass",
-    interswitch: ENV.interswitchClientSecret || "demo_interswitch_secret",
-  };
-  return keyMap[slug];
+  switch (slug) {
+    case "paystack":
+      return requireSecret(ENV.paystackSecretKey, "PAYSTACK_SECRET_KEY");
+    case "flutterwave":
+      return requireSecret(ENV.flutterwaveSecretKey, "FLUTTERWAVE_SECRET_KEY");
+    case "interswitch":
+      return requireSecret(ENV.interswitchClientSecret, "INTERSWITCH_CLIENT_SECRET");
+  }
 }

@@ -5,7 +5,15 @@ import {
 
 // ── Enums ─────────────────────────────────────────────────────────────────────
 
-export const userRoleEnum = pgEnum("user_role", ["user", "admin"]);
+export const userRoleEnum = pgEnum("user_role", [
+  "user",
+  "admin",
+  "agent",
+  "operator",
+  "reviewer",
+  "support",
+  "installer",
+]);
 export const kycTypeEnum = pgEnum("kyc_type", ["driver", "vehicle", "fleet"]);
 export const kycStatusEnum = pgEnum("kyc_status", [
   "draft",
@@ -70,12 +78,16 @@ export const kycApplications = pgTable("kyc_applications", {
   fromOfflineQueue: boolean("fromOfflineQueue").default(false).notNull(),
   /** Client-side draft version at time of submission */
   clientVersion: integer("clientVersion").default(1).notNull(),
+  /** Client-generated draft ID for offline-queue idempotency (unique per user+type) */
+  draftId: varchar("draftId", { length: 64 }),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().notNull(),
 }, (table) => [
   index("idx_kyc_userId").on(table.userId),
   index("idx_kyc_status").on(table.status),
   index("idx_kyc_type").on(table.type),
+  // Idempotency for offline draft replay: one application per (user, type, draftId)
+  unique("uq_kyc_user_type_draft").on(table.userId, table.type, table.draftId),
 ]);
 
 export type KycApplication = typeof kycApplications.$inferSelect;
@@ -134,6 +146,8 @@ export const walletTransactions = pgTable("wallet_transactions", {
   index("idx_wtx_walletId").on(table.walletId),
   index("idx_wtx_type").on(table.type),
   index("idx_wtx_createdAt").on(table.createdAt),
+  // Idempotency guard: an external payment reference may only be credited once
+  unique("uq_wtx_externalRef").on(table.externalRef),
 ]);
 
 export type WalletTransaction = typeof walletTransactions.$inferSelect;
@@ -312,6 +326,9 @@ export const deviceStatusEnum = pgEnum("device_status", [
   "offline",
   "warning",
   "maintenance",
+  "lost",
+  "stolen",
+  "decommissioned",
 ]);
 
 export const tollDevices = pgTable("toll_devices", {
@@ -407,6 +424,10 @@ export const ussdSessions = pgTable("ussd_sessions", {
   durationSeconds: integer("durationSeconds"),
   /** ISO country code derived from phone number */
   countryCode: varchar("countryCode", { length: 4 }),
+  /** Live session state for multi-instance USSD handling (screen, inputs, etc.) */
+  state: jsonb("state").$type<Record<string, unknown>>(),
+  /** Last interaction time — used for TTL sweeps */
+  lastActivityAt: timestamp("lastActivityAt").defaultNow().notNull(),
   startedAt: timestamp("startedAt").defaultNow().notNull(),
   endedAt: timestamp("endedAt"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
@@ -452,3 +473,212 @@ export const qrScanLogs = pgTable("qr_scan_logs", {
 ]);
 export type QrScanLog = typeof qrScanLogs.$inferSelect;
 export type InsertQrScanLog = typeof qrScanLogs.$inferInsert;
+
+// ── NFC Provisioning Events ───────────────────────────────────────────────────
+/**
+ * Immutable audit trail for NFC tag provisioning.
+ * Replaces the legacy abuse of kyc_applications as an NFC audit log.
+ * The full derived key is NEVER stored — only an 8-char prefix.
+ */
+export const nfcProvisioningEvents = pgTable("nfc_provisioning_events", {
+  id: serial("id").primaryKey(),
+  /** Human-readable event reference (e.g. NFC-ABCD1234-LXYZ) */
+  refId: varchar("refId", { length: 48 }).notNull().unique(),
+  tagId: varchar("tagId", { length: 64 }).notNull(),
+  vehicleRef: varchar("vehicleRef", { length: 64 }).notNull(),
+  /** First 8 hex chars of the derived key + "..." — never the full key */
+  keyHexPrefix: varchar("keyHexPrefix", { length: 16 }).notNull(),
+  /** NDEF payload signature */
+  signature: varchar("signature", { length: 32 }).notNull(),
+  /** User who provisioned the tag */
+  provisionedBy: integer("provisionedBy").notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, (table) => [
+  index("idx_nfc_prov_tagId").on(table.tagId),
+  index("idx_nfc_prov_provisionedBy").on(table.provisionedBy),
+  index("idx_nfc_prov_createdAt").on(table.createdAt),
+]);
+export type NfcProvisioningEvent = typeof nfcProvisioningEvents.$inferSelect;
+export type InsertNfcProvisioningEvent = typeof nfcProvisioningEvents.$inferInsert;
+
+// ── Audit Logs ────────────────────────────────────────────────────────────────
+/**
+ * Append-only audit trail for security-relevant administrative actions.
+ */
+export const auditLogs = pgTable("audit_logs", {
+  id: serial("id").primaryKey(),
+  /** User performing the action (null for system jobs) */
+  actorUserId: integer("actorUserId"),
+  actorRole: varchar("actorRole", { length: 32 }),
+  /** e.g. "kyc.approve", "wallet.credit", "nfc.provision", "refund.issue" */
+  action: varchar("action", { length: 64 }).notNull(),
+  /** Entity type, e.g. "kyc_application", "wallet", "nfc_tag", "user" */
+  entity: varchar("entity", { length: 64 }).notNull(),
+  /** Entity identifier (referenceId, wallet id, tag id, ...) */
+  entityId: varchar("entityId", { length: 128 }).notNull(),
+  /** Before/after diff or contextual metadata */
+  diff: jsonb("diff").$type<Record<string, unknown>>(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, (table) => [
+  index("idx_audit_actor").on(table.actorUserId),
+  index("idx_audit_entity").on(table.entity, table.entityId),
+  index("idx_audit_createdAt").on(table.createdAt),
+]);
+export type AuditLog = typeof auditLogs.$inferSelect;
+export type InsertAuditLog = typeof auditLogs.$inferInsert;
+
+// ── KYC Status History ────────────────────────────────────────────────────────
+/**
+ * Immutable history of every status transition on a KYC application.
+ */
+export const kycStatusHistory = pgTable("kyc_status_history", {
+  id: serial("id").primaryKey(),
+  referenceId: varchar("referenceId", { length: 32 }).notNull(),
+  fromStatus: varchar("fromStatus", { length: 32 }),
+  toStatus: varchar("toStatus", { length: 32 }).notNull(),
+  changedBy: integer("changedBy"),
+  notes: text("notes"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, (table) => [
+  index("idx_ksh_referenceId").on(table.referenceId),
+  index("idx_ksh_createdAt").on(table.createdAt),
+]);
+export type KycStatusHistory = typeof kycStatusHistory.$inferSelect;
+export type InsertKycStatusHistory = typeof kycStatusHistory.$inferInsert;
+
+// ── Sessions (JWT revocation) ─────────────────────────────────────────────────
+/**
+ * Server-side session registry keyed by JWT ID (jti) for revocation support.
+ */
+export const sessions = pgTable("sessions", {
+  id: serial("id").primaryKey(),
+  /** JWT ID claim — unique per issued token */
+  jti: varchar("jti", { length: 64 }).notNull().unique(),
+  userId: integer("userId").notNull(),
+  /** Set when the session is revoked (logout / logoutAll / admin action) */
+  revokedAt: timestamp("revokedAt"),
+  expiresAt: timestamp("expiresAt").notNull(),
+  ip: varchar("ip", { length: 45 }),
+  userAgent: varchar("userAgent", { length: 256 }),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, (table) => [
+  index("idx_sessions_userId").on(table.userId),
+  index("idx_sessions_expiresAt").on(table.expiresAt),
+]);
+export type Session = typeof sessions.$inferSelect;
+export type InsertSession = typeof sessions.$inferInsert;
+
+// ── Consents (NDPR) ───────────────────────────────────────────────────────────
+export const consentTypeEnum = pgEnum("consent_type", [
+  "terms_of_service",
+  "privacy_policy",
+  "marketing",
+  "data_processing",
+  "location_tracking",
+]);
+export const consents = pgTable("consents", {
+  id: serial("id").primaryKey(),
+  userId: integer("userId").notNull(),
+  type: consentTypeEnum("type").notNull(),
+  /** Version string of the document consented to (e.g. "v1.2") */
+  version: varchar("version", { length: 32 }).notNull(),
+  granted: boolean("granted").notNull().default(true),
+  ip: varchar("ip", { length: 45 }),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, (table) => [
+  index("idx_consents_userId").on(table.userId),
+  index("idx_consents_type").on(table.type),
+]);
+export type Consent = typeof consents.$inferSelect;
+export type InsertConsent = typeof consents.$inferInsert;
+
+// ── Refunds / Disputes ────────────────────────────────────────────────────────
+export const refundStatusEnum = pgEnum("refund_status", [
+  "pending",
+  "awaiting_second_approval",
+  "approved",
+  "rejected",
+  "processed",
+  "failed",
+]);
+export const refunds = pgTable("refunds", {
+  id: serial("id").primaryKey(),
+  /** Human-readable reference (e.g. RFD-XKQP7) */
+  refundRef: varchar("refundRef", { length: 32 }).notNull().unique(),
+  walletId: integer("walletId").notNull(),
+  /** The wallet_transactions row being refunded (if known) */
+  transactionId: integer("transactionId"),
+  amountKobo: bigint("amountKobo", { mode: "number" }).notNull(),
+  reason: text("reason").notNull(),
+  status: refundStatusEnum("status").notNull().default("pending"),
+  /** Admin who requested the refund */
+  requestedBy: integer("requestedBy").notNull(),
+  /** Second admin who approved (4-eyes for amounts > ₦50,000) */
+  approvedBy: integer("approvedBy"),
+  /** Provider-side refund reference once processed */
+  providerRef: varchar("providerRef", { length: 128 }),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+}, (table) => [
+  index("idx_refunds_walletId").on(table.walletId),
+  index("idx_refunds_status").on(table.status),
+]);
+export type Refund = typeof refunds.$inferSelect;
+export type InsertRefund = typeof refunds.$inferInsert;
+
+export const disputes = pgTable("disputes", {
+  id: serial("id").primaryKey(),
+  /** Provider dispute/chargeback reference */
+  disputeRef: varchar("disputeRef", { length: 128 }).notNull().unique(),
+  provider: varchar("provider", { length: 32 }).notNull(),
+  /** Payment reference under dispute */
+  paymentRef: varchar("paymentRef", { length: 128 }).notNull(),
+  walletId: integer("walletId"),
+  amountKobo: bigint("amountKobo", { mode: "number" }),
+  /** When true, wallet funds are frozen pending resolution */
+  fundsFrozen: boolean("fundsFrozen").notNull().default(true),
+  status: varchar("status", { length: 32 }).notNull().default("open"),
+  rawPayload: jsonb("rawPayload").$type<Record<string, unknown>>(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  resolvedAt: timestamp("resolvedAt"),
+}, (table) => [
+  index("idx_disputes_paymentRef").on(table.paymentRef),
+  index("idx_disputes_walletId").on(table.walletId),
+]);
+export type Dispute = typeof disputes.$inferSelect;
+export type InsertDispute = typeof disputes.$inferInsert;
+
+// ── Fraud Labels ──────────────────────────────────────────────────────────────
+export const fraudLabels = pgTable("fraud_labels", {
+  id: serial("id").primaryKey(),
+  /** e.g. "user", "wallet", "device", "kyc_application" */
+  entityType: varchar("entityType", { length: 32 }).notNull(),
+  entityId: varchar("entityId", { length: 128 }).notNull(),
+  label: varchar("label", { length: 64 }).notNull(),
+  /** Optional model confidence score 0–1 */
+  score: integer("score"),
+  createdBy: integer("createdBy"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+}, (table) => [
+  index("idx_fraud_entity").on(table.entityType, table.entityId),
+]);
+export type FraudLabel = typeof fraudLabels.$inferSelect;
+export type InsertFraudLabel = typeof fraudLabels.$inferInsert;
+
+// ── Agent Registry ────────────────────────────────────────────────────────────
+export const agentStatusEnum = pgEnum("agent_status", ["active", "suspended", "deactivated"]);
+export const agents = pgTable("agents", {
+  id: serial("id").primaryKey(),
+  /** FK to users.id */
+  userId: integer("userId").notNull().unique(),
+  /** Public agent code (e.g. AGT-LAG-001) */
+  agentCode: varchar("agentCode", { length: 32 }).notNull().unique(),
+  region: varchar("region", { length: 64 }),
+  status: agentStatusEnum("status").notNull().default("active"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+}, (table) => [
+  index("idx_agents_status").on(table.status),
+]);
+export type Agent = typeof agents.$inferSelect;
+export type InsertAgent = typeof agents.$inferInsert;

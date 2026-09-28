@@ -5,7 +5,7 @@
  *  - devices.resolveAlert  — clears alert count, persists note, admin-only
  *  - devices.printPlazaQrSheet — generates A4 PDF with QR codes for all NFC readers at a plaza
  */
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 // ── Shared mock DB state ───────────────────────────────────────────────────────
 
@@ -241,6 +241,15 @@ describe("devices.printPlazaQrSheet", () => {
   beforeEach(() => {
     resetDb();
     vi.clearAllMocks();
+    // QR HMAC secret fallback was removed (audit v13, P0-6): the router throws
+    // PRECONDITION_FAILED when no signing secret is configured. Provide one
+    // (stubbed before the dynamic router import so ENV picks it up).
+    vi.stubEnv("NFC_MASTER_SECRET", "test-qr-signing-secret");
+    vi.stubEnv("JWT_SECRET", "test-qr-signing-secret");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   it("returns a base64 PDF with correct metadata for a plaza with NFC readers", async () => {

@@ -4,6 +4,7 @@ import axios, { type AxiosInstance } from "axios";
 import { parse as parseCookieHeader } from "cookie";
 import type { Request } from "express";
 import { SignJWT, jwtVerify } from "jose";
+import crypto from "crypto";
 import type { User } from "../../drizzle/schema";
 import * as db from "../db";
 import { ENV } from "./env";
@@ -22,6 +23,8 @@ export type SessionPayload = {
   openId: string;
   appId: string;
   name: string;
+  /** JWT ID — registered server-side so sessions can be revoked (P1-18) */
+  jti?: string;
 };
 
 const EXCHANGE_TOKEN_PATH = `/webdev.v1.WebDevAuthPublicService/ExchangeToken`;
@@ -187,19 +190,30 @@ class SDKServer {
     const expirationSeconds = Math.floor((issuedAt + expiresInMs) / 1000);
     const secretKey = this.getSessionSecret();
 
+    // Unique JWT ID so the session can be revoked server-side (P1-18)
+    const jti = payload.jti ?? crypto.randomUUID();
+    const expiresAt = new Date(issuedAt + expiresInMs);
+
+    // Register the session (fire-and-forget — must not block sign-in)
+    void db.getUserByOpenId(payload.openId)
+      .then(u => u ? db.createSessionRecord({ jti, userId: u.id, expiresAt }) : undefined)
+      .catch(err => console.warn("[Auth] Failed to register session:", err));
+
     return new SignJWT({
       openId: payload.openId,
       appId: payload.appId,
       name: payload.name,
+      jti,
     })
       .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+      .setJti(jti)
       .setExpirationTime(expirationSeconds)
       .sign(secretKey);
   }
 
   async verifySession(
     cookieValue: string | undefined | null
-  ): Promise<{ openId: string; appId: string; name: string } | null> {
+  ): Promise<{ openId: string; appId: string; name: string; jti?: string } | null> {
     if (!cookieValue) {
       console.warn("[Auth] Missing session cookie");
       return null;
@@ -210,7 +224,7 @@ class SDKServer {
       const { payload } = await jwtVerify(cookieValue, secretKey, {
         algorithms: ["HS256"],
       });
-      const { openId, appId, name } = payload as Record<string, unknown>;
+      const { openId, appId, name, jti } = payload as Record<string, unknown>;
 
       if (
         !isNonEmptyString(openId) ||
@@ -225,6 +239,7 @@ class SDKServer {
         openId,
         appId,
         name,
+        jti: typeof jti === "string" ? jti : undefined,
       };
     } catch (error) {
       console.warn("[Auth] Session verification failed", String(error));
@@ -256,6 +271,11 @@ class SDKServer {
     } as GetUserInfoWithJwtResponse;
   }
 
+  /** Extract the raw session token from the request cookies. */
+  getSessionTokenFromCookie(req: Request): string | undefined {
+    return this.parseCookies(req.headers.cookie).get(COOKIE_NAME);
+  }
+
   async authenticateRequest(req: Request): Promise<User> {
     // Regular authentication flow
     const cookies = this.parseCookies(req.headers.cookie);
@@ -264,6 +284,19 @@ class SDKServer {
 
     if (!session) {
       throw ForbiddenError("Invalid session cookie");
+    }
+
+    // Server-side revocation check (P1-18): a revoked jti is rejected even
+    // though the JWT signature and expiry are still valid.
+    if (session.jti) {
+      try {
+        if (await db.isSessionRevoked(session.jti)) {
+          throw ForbiddenError("Session has been revoked");
+        }
+      } catch (err) {
+        if (err instanceof ForbiddenError) throw err;
+        console.warn("[Auth] Session revocation check failed:", err);
+      }
     }
 
     const sessionUserId = session.openId;

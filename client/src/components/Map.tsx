@@ -116,9 +116,14 @@ interface MapViewProps {
   onMapReady?: (map: google.maps.Map) => void;
 }
 
+// Map ID is required for cloud styling/AdvancedMarker features.
+// Configure it via VITE_GOOGLE_MAP_ID — when unset we render an honest
+// fallback notice instead of silently using Google's demo map ID.
+const GOOGLE_MAP_ID = (import.meta.env.VITE_GOOGLE_MAP_ID as string | undefined) || "";
+
 export function MapView({
   className,
-  initialCenter = { lat: 37.7749, lng: -122.4194 },
+  initialCenter = { lat: 6.5244, lng: 3.3794 }, // Lagos, Nigeria
   initialZoom = 12,
   onMapReady,
 }: MapViewProps) {
@@ -126,6 +131,7 @@ export function MapView({
   const map = useRef<google.maps.Map | null>(null);
 
   const init = usePersistFn(async () => {
+    if (!GOOGLE_MAP_ID) return; // fallback message rendered below
     await loadMapScript();
     if (!mapContainer.current) {
       console.error("Map container not found");
@@ -138,7 +144,7 @@ export function MapView({
       fullscreenControl: true,
       zoomControl: true,
       streetViewControl: true,
-      mapId: "DEMO_MAP_ID",
+      mapId: GOOGLE_MAP_ID,
     });
     if (onMapReady) {
       onMapReady(map.current);
@@ -148,6 +154,17 @@ export function MapView({
   useEffect(() => {
     init();
   }, [init]);
+
+  if (!GOOGLE_MAP_ID) {
+    return (
+      <div className={cn("w-full h-[500px] flex items-center justify-center bg-muted rounded-lg", className)}>
+        <p className="text-sm text-muted-foreground text-center px-6">
+          Live map unavailable — Google Maps Map ID is not configured
+          (set <code className="font-mono text-xs">VITE_GOOGLE_MAP_ID</code>).
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div ref={mapContainer} className={cn("w-full h-[500px]", className)} />

@@ -4,7 +4,7 @@ import { lazy, Suspense, useEffect } from "react";
 import { Route, Switch, useLocation } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
-import { AuthProvider, useAuth } from "./contexts/AuthContext";
+import { useAuth } from "./_core/hooks/useAuth";
 import { DataSaverProvider } from "./contexts/DataSaverContext";
 import DataSaverBanner from "./components/DataSaverBanner";
 import NetworkStatusBar from "./components/NetworkStatusBar";
@@ -98,19 +98,19 @@ function ProtectedRoute({
   component: React.ComponentType;
   requiredRole?: string;
 }) {
-  const { isAuthenticated, isLoading, user } = useAuth();
+  const { isAuthenticated, loading, user } = useAuth();
   const [, navigate] = useLocation();
 
   useEffect(() => {
-    if (!isLoading && !isAuthenticated) {
+    if (!loading && !isAuthenticated) {
       navigate("/auth/login");
     }
-    if (!isLoading && isAuthenticated && requiredRole && user?.role !== requiredRole) {
+    if (!loading && isAuthenticated && requiredRole && user?.role !== requiredRole) {
       navigate("/");
     }
-  }, [isAuthenticated, isLoading, navigate, requiredRole, user]);
+  }, [isAuthenticated, loading, navigate, requiredRole, user]);
 
-  if (isLoading) {
+  if (loading) {
     return <RouteSkeleton />;
   }
 
@@ -237,12 +237,10 @@ function App() {
     <ErrorBoundary>
       <ThemeProvider defaultTheme="light">
         <DataSaverProvider>
-          <AuthProvider>
-            <TooltipProvider>
-              <Toaster richColors position="top-right" />
-              <Router />
-            </TooltipProvider>
-          </AuthProvider>
+          <TooltipProvider>
+            <Toaster richColors position="top-right" />
+            <Router />
+          </TooltipProvider>
         </DataSaverProvider>
       </ThemeProvider>
     </ErrorBoundary>

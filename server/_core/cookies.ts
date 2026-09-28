@@ -42,7 +42,10 @@ export function getSessionCookieOptions(
   return {
     httpOnly: true,
     path: "/",
-    sameSite: "none",
+    // CSRF hardening (audit v13, P1-23): the session cookie is only sent on
+    // same-site navigations and top-level cross-site GETs, not on cross-site
+    // POSTs.
+    sameSite: "lax",
     secure: isSecureRequest(req),
   };
 }

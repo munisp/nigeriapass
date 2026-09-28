@@ -1,0 +1,50 @@
+{
+  "realm": "nigerianpass",
+  "enabled": true,
+  "displayName": "NigerianPass Backoffice",
+  "comment": "Backoffice SSO ONLY. End users authenticate with phone-OTP (server/services/otp.ts) and never touch Keycloak.",
+  "roles": {
+    "realm": [
+      { "name": "admin", "description": "Full platform administration" },
+      { "name": "operator", "description": "Plaza/device operations" },
+      { "name": "reviewer", "description": "KYC application review queue" },
+      { "name": "support", "description": "Read-only support tooling" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "nigerianpass-backoffice",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "${KEYCLOAK_CLIENT_SECRET:-change-me-in-env}",
+      "redirectUris": ["http://localhost:3000/backoffice/*", "https://*/backoffice/*"],
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "protocolMappers": [
+        {
+          "name": "realm-roles-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "reviewer.demo",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "reviewer.demo@nigerianpass.example",
+      "realmRoles": ["reviewer"],
+      "credentials": [{ "type": "password", "value": "demo-password-change-me", "temporary": false }]
+    }
+  ]
+}

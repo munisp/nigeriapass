@@ -19,7 +19,34 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Camera, CheckCircle2, AlertCircle, Loader2, RefreshCw, Eye } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { livenessApi } from "@/lib/api";
+
+// ─── Server-side liveness verification ───────────────────────────────────────
+// The score/pass decision MUST come from the backend anti-spoofing service.
+// There is no client-side fallback: if the service is unreachable the UI shows
+// a blocking "liveness unavailable" error instead of inventing a score.
+const LIVENESS_ENDPOINT =
+  (import.meta.env.VITE_LIVENESS_API_URL as string | undefined) ??
+  "/api/onboarding/liveness/passive-verify";
+
+async function requestLivenessScore(
+  selfieBlob: Blob,
+  completedChallenges: string[]
+): Promise<{ passed: boolean; score: number }> {
+  const form = new FormData();
+  form.append("selfie", selfieBlob, "selfie.jpg");
+  form.append("challenges", JSON.stringify(completedChallenges));
+  const res = await fetch(LIVENESS_ENDPOINT, {
+    method: "POST",
+    body: form,
+    credentials: "include",
+  });
+  if (!res.ok) throw new Error(`Liveness service returned HTTP ${res.status}`);
+  const data = (await res.json()) as { passed?: unknown; score?: unknown };
+  if (typeof data.passed !== "boolean" || typeof data.score !== "number") {
+    throw new Error("Liveness service returned an invalid response");
+  }
+  return { passed: data.passed, score: data.score };
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -174,10 +201,14 @@ export default function LivenessCapture({ onComplete, onError, challengeCount = 
 
       startDetectionLoop();
     } catch {
-      // MediaPipe CDN unavailable — use simulated liveness for demo
-      startSimulatedLiveness();
+      // MediaPipe CDN unavailable — fail closed: no simulated liveness.
+      cleanup();
+      const msg = "Liveness unavailable — the face-detection library could not be loaded. Check your connection and retry.";
+      setErrorMsg(msg);
+      setPhase("error");
+      onError?.(msg);
     }
-  }, []);
+  }, [cleanup, onError]);
 
   // ─── Detection loop ─────────────────────────────────────────────────────────
   const startDetectionLoop = useCallback(() => {
@@ -336,50 +367,31 @@ export default function LivenessCapture({ onComplete, onError, challengeCount = 
     const blob = await (await fetch(dataUrl)).blob();
 
     try {
-      const result = await livenessApi.verify(blob, completed);
-      const score = result.score ?? 0.92;
-      setLivenessScore(Math.round(score * 100));
-      setPhase("done");
+      // Score and pass/fail come from the server anti-spoofing service only
+      const result = await requestLivenessScore(blob, completed);
+      setLivenessScore(Math.round(result.score * 100));
       cleanup();
-      onComplete({
-        passed: score >= 0.5,
-        score: Math.round(score * 100),
-        selfieBlob: blob,
-        challengeCompleted: completed[completed.length - 1],
-      });
-    } catch {
-      // API unavailable — use local score based on challenge completion
-      const localScore = 0.85 + Math.random() * 0.12;
-      setLivenessScore(Math.round(localScore * 100));
-      setPhase("done");
-      cleanup();
-      onComplete({
-        passed: true,
-        score: Math.round(localScore * 100),
-        selfieBlob: blob,
-        challengeCompleted: completed[completed.length - 1],
-      });
-    }
-  }, [cleanup, onComplete]);
-
-  // ─── Simulated liveness (MediaPipe unavailable) ──────────────────────────────
-  const startSimulatedLiveness = useCallback(() => {
-    setPhase("challenge");
-    const challenge = CHALLENGES[Math.floor(Math.random() * CHALLENGES.length)];
-    setCurrentChallenge(challenge);
-    setFaceDetected(true);
-
-    let progress = 0;
-    const interval = setInterval(() => {
-      progress += 4;
-      setChallengeProgress(Math.min(progress, 100));
-      if (progress >= 100) {
-        clearInterval(interval);
-        setCompletedChallenges([challenge.id]);
-        captureSelfieAndVerify([challenge.id]);
+      if (result.passed) {
+        setPhase("done");
+      } else {
+        setErrorMsg("Liveness check failed (server anti-spoofing score too low). Please retry in good lighting, without masks or photos of photos.");
+        setPhase("error");
       }
-    }, 80);
-  }, [captureSelfieAndVerify]);
+      onComplete({
+        passed: result.passed,
+        score: Math.round(result.score * 100),
+        selfieBlob: blob,
+        challengeCompleted: completed[completed.length - 1],
+      });
+    } catch (err) {
+      // Fail closed — never invent a liveness score
+      cleanup();
+      const msg = `Liveness unavailable — verification service could not be reached. Please retry. (${err instanceof Error ? err.message : "network error"})`;
+      setErrorMsg(msg);
+      setPhase("error");
+      onError?.(msg);
+    }
+  }, [cleanup, onComplete, onError]);
 
   // ─── Start challenge after face detected ─────────────────────────────────────
   useEffect(() => {
@@ -473,7 +485,7 @@ export default function LivenessCapture({ onComplete, onError, challengeCount = 
             >
               <CheckCircle2 className="w-12 h-12 text-emerald-400" />
               <p className="text-white text-sm font-bold">Liveness Verified</p>
-              <p className="text-emerald-300 text-xs">Score: {livenessScore}%</p>
+              <p className="text-emerald-300 text-xs">Score: {livenessScore}% · anti-spoofing scored server-side</p>
             </motion.div>
           )}
 

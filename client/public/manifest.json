@@ -13,30 +13,36 @@
   "lang": "en-NG",
   "dir": "ltr",
   "icons": [
-    { "src": "https://d2xsxph8kpxj0f.cloudfront.net/114501028/9uoCntQGmxrFDSX5CAeixb/icon-72_dd31ccfd.png", "sizes": "72x72", "type": "image/png", "purpose": "any" },
-    { "src": "https://d2xsxph8kpxj0f.cloudfront.net/114501028/9uoCntQGmxrFDSX5CAeixb/icon-96_4a475697.png", "sizes": "96x96", "type": "image/png", "purpose": "any" },
-    { "src": "https://d2xsxph8kpxj0f.cloudfront.net/114501028/9uoCntQGmxrFDSX5CAeixb/icon-128_9441c0b0.png", "sizes": "128x128", "type": "image/png", "purpose": "any" },
-    { "src": "https://d2xsxph8kpxj0f.cloudfront.net/114501028/9uoCntQGmxrFDSX5CAeixb/icon-144_ddb7bf0d.png", "sizes": "144x144", "type": "image/png", "purpose": "any" },
-    { "src": "https://d2xsxph8kpxj0f.cloudfront.net/114501028/9uoCntQGmxrFDSX5CAeixb/icon-152_293fe837.png", "sizes": "152x152", "type": "image/png", "purpose": "any" },
-    { "src": "https://d2xsxph8kpxj0f.cloudfront.net/114501028/9uoCntQGmxrFDSX5CAeixb/icon-192_7110dc9d.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
-    { "src": "https://d2xsxph8kpxj0f.cloudfront.net/114501028/9uoCntQGmxrFDSX5CAeixb/icon-384_9dc7223e.png", "sizes": "384x384", "type": "image/png", "purpose": "any" },
-    { "src": "https://d2xsxph8kpxj0f.cloudfront.net/114501028/9uoCntQGmxrFDSX5CAeixb/icon-512_f8ddc317.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+    { "src": "/icons/icon-72.png", "sizes": "72x72", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-96.png", "sizes": "96x96", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-128.png", "sizes": "128x128", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-144.png", "sizes": "144x144", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-152.png", "sizes": "152x152", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icons/icon-384.png", "sizes": "384x384", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
   ],
   "shortcuts": [
     {
-      "name": "Check Status", "short_name": "Status",
-      "description": "Track your KYC application status", "url": "/status",
-      "icons": [{ "src": "https://d2xsxph8kpxj0f.cloudfront.net/114501028/9uoCntQGmxrFDSX5CAeixb/icon-96_4a475697.png", "sizes": "96x96" }]
+      "name": "My Wallet",
+      "short_name": "Wallet",
+      "description": "View wallet balance and top up",
+      "url": "/wallet",
+      "icons": [{ "src": "/icons/icon-96.png", "sizes": "96x96", "type": "image/png" }]
     },
     {
-      "name": "My Wallet", "short_name": "Wallet",
-      "description": "View wallet balance and top up", "url": "/wallet",
-      "icons": [{ "src": "https://d2xsxph8kpxj0f.cloudfront.net/114501028/9uoCntQGmxrFDSX5CAeixb/icon-96_4a475697.png", "sizes": "96x96" }]
+      "name": "Check Status",
+      "short_name": "Status",
+      "description": "Track your KYC application status",
+      "url": "/status",
+      "icons": [{ "src": "/icons/icon-96.png", "sizes": "96x96", "type": "image/png" }]
     },
     {
-      "name": "Toll Map", "short_name": "Map",
-      "description": "Live toll plaza map", "url": "/map",
-      "icons": [{ "src": "https://d2xsxph8kpxj0f.cloudfront.net/114501028/9uoCntQGmxrFDSX5CAeixb/icon-96_4a475697.png", "sizes": "96x96" }]
+      "name": "Toll Map",
+      "short_name": "Map",
+      "description": "Live toll plaza map",
+      "url": "/map",
+      "icons": [{ "src": "/icons/icon-96.png", "sizes": "96x96", "type": "image/png" }]
     }
   ],
   "prefer_related_applications": false

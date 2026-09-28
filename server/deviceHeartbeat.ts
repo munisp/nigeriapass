@@ -23,9 +23,35 @@
 
 import { WebSocketServer, WebSocket } from "ws";
 import type { Server } from "http";
+import crypto from "crypto";
 import { getDb } from "./db";
 import { tollDevices } from "../drizzle/schema";
 import { eq } from "drizzle-orm";
+import { ENV } from "./_core/env";
+
+/**
+ * Device authentication (audit v13, P0-9): a device must present a token
+ *   token = HMAC_SHA256(DEVICE_HEARTBEAT_SECRET, serial)
+ * either as the ?token= query parameter or as msg.token in the heartbeat.
+ * User-Agent and ?device are NOT trusted as authentication signals.
+ */
+function heartbeatSecret(): string | null {
+  return ENV.deviceHeartbeatSecret || ENV.nfcMasterSecret || ENV.cookieSecret || null;
+}
+
+export function computeDeviceToken(serial: string): string | null {
+  const secret = heartbeatSecret();
+  if (!secret) return null;
+  return crypto.createHmac("sha256", secret).update(`device:${serial}`).digest("hex");
+}
+
+export function isValidDeviceToken(serial: string, token: string | undefined | null): boolean {
+  const expected = computeDeviceToken(serial);
+  if (!expected || !token) return false;
+  const a = Buffer.from(token);
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 
 export interface DeviceHeartbeat {
   device_id: string;
@@ -64,10 +90,38 @@ export function setupDeviceHeartbeatServer(httpServer: Server): WebSocketServer 
     const isDevice = userAgent.includes("NigerianPass-Device") || url.searchParams.has("device");
 
     if (isDevice) {
-      // Device connection — accept heartbeat pushes
+      // Device connection — requires a valid device token before any
+      // heartbeat is accepted (P0-9). Token may be supplied via ?token= at
+      // upgrade time or as msg.token on the first heartbeat frame.
+      const queryToken = url.searchParams.get("token");
+      const querySerial = url.searchParams.get("serial");
+      let authedSerial: string | null =
+        querySerial && isValidDeviceToken(querySerial, queryToken) ? querySerial : null;
+
+      if (!heartbeatSecret()) {
+        // Fail closed when no device secret is configured.
+        sendWs(ws, { type: "error", reason: "device_auth_not_configured" });
+        ws.close(4401, "device auth not configured");
+        return;
+      }
+
       ws.on("message", async (data: Buffer | string) => {
         try {
-          const msg = JSON.parse(data.toString()) as DeviceHeartbeat & { type?: string };
+          const msg = JSON.parse(data.toString()) as DeviceHeartbeat & { type?: string; token?: string };
+          const serial = msg.serial ?? msg.device_id ?? "";
+          if (!authedSerial) {
+            if (!serial || !isValidDeviceToken(serial, msg.token)) {
+              sendWs(ws, { type: "error", reason: "invalid_device_token" });
+              ws.close(4401, "invalid device token");
+              return;
+            }
+            authedSerial = serial;
+          }
+          // A connection may only push heartbeats for its authenticated serial
+          if (serial && serial !== authedSerial) {
+            sendWs(ws, { type: "error", reason: "serial_mismatch" });
+            return;
+          }
           if (msg.type === "heartbeat" || msg.device_id) {
             await handleDeviceHeartbeat(msg);
           }

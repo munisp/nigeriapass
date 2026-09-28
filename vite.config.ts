@@ -150,7 +150,21 @@ function vitePluginManusDebugCollector(): Plugin {
   };
 }
 
-const plugins = [react(), tailwindcss(), jsxLocPlugin(), vitePluginManusRuntime(), vitePluginManusDebugCollector()];
+// =============================================================================
+// Production vs development plugin set
+// ─────────────────────────────────────────────────────────────────────────────
+// The Manus debug/jsx-loc/runtime plugins inject scripts and middleware that
+// are only useful inside the Manus dev sandbox. In production builds they add
+// dead code, slow the build, and (for jsx-loc) bloat every JSX element with
+// data attributes — so they are excluded when NODE_ENV=production.
+// =============================================================================
+const isProd = process.env.NODE_ENV === "production";
+
+const devOnlyPlugins: Plugin[] = isProd
+  ? []
+  : [jsxLocPlugin(), vitePluginManusRuntime(), vitePluginManusDebugCollector()];
+
+const plugins = [react(), tailwindcss(), ...devOnlyPlugins];
 
 export default defineConfig({
   plugins,
@@ -176,9 +190,35 @@ export default defineConfig({
   envDir: path.resolve(import.meta.dirname),
   root: path.resolve(import.meta.dirname, "client"),
   publicDir: path.resolve(import.meta.dirname, "client", "public"),
+  // esbuild minify (Vite default) with console/debugger stripped in prod.
+  // esbuild is ~20-30x faster than terser and the size delta is <2%.
+  esbuild: isProd
+    ? {
+        drop: ["console", "debugger"],
+        legalComments: "none",
+      }
+    : undefined,
   build: {
     outDir: path.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true,
+    // es2020: native dynamic import + optional chaining — covers all
+    // browsers that support service workers/PWA install (Chrome 80+,
+    // Safari 14+), without paying for legacy transpilation.
+    target: "es2020",
+    minify: "esbuild",
+    // No sourcemaps in prod payloads (they'd double the transfer size).
+    // Flip to "hidden" temporarily if you need to debug a prod-only issue.
+    sourcemap: false,
+    // Split CSS per chunk so lazy routes don't load the full stylesheet.
+    cssCodeSplit: true,
+    // Inline tiny assets (<4KB) as data URLs to save round-trips on 3G.
+    assetsInlineLimit: 4096,
+    // modulepreload polyfill + automatic preload of entry chunks (default
+    // behaviour) — kept explicit so future edits don't regress it.
+    modulePreload: { polyfill: true },
+    // Vendor chunks are long-cacheable (content-hashed); warn only when a
+    // single chunk threatens the 350KB gzip initial-bundle budget.
+    chunkSizeWarningLimit: 500,
     rollupOptions: {
       output: {
         /**
@@ -228,6 +268,13 @@ export default defineConfig({
           // Radix UI primitives
           if (id.includes("node_modules/@radix-ui/")) {
             return "vendor-ui";
+          }
+          // Google Maps helpers — only needed on the /map route (the JS API
+          // itself loads lazily via script bootstrap, so keep any wrapper
+          // libs out of the initial bundle too).
+          if (id.includes("node_modules/@googlemaps/") ||
+              id.includes("node_modules/@react-google-maps/")) {
+            return "vendor-maps";
           }
           // Lucide icons
           if (id.includes("node_modules/lucide-react")) {

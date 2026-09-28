@@ -25,10 +25,11 @@
  *  └──────────────────────────────────────────────────────────────────┘
  */
 
-import { eq, and, or, lt } from "drizzle-orm";
+import { eq, and, lt, sql } from "drizzle-orm";
 import { getDb } from "../db";
 import { walletAccounts, walletTransactions, users } from "../../drizzle/schema";
 import { getProvider, getProviderSecretKey, PaymentProviderSlug } from "../payments/gateway";
+import { parsePaymentReference } from "../payments/reference";
 import { getKycStatusEmitter } from "../events/kycEvents";
 import { notifyOwner } from "../_core/notification";
 import { createReconciliationRun } from "../db";
@@ -141,12 +142,12 @@ export async function reconcile(): Promise<ReconciliationResult> {
   for (const txn of pendingTransactions) {
     const ref = txn.externalRef ?? "";
 
-    // Extract provider slug from reference format: NP-PAYSTACK-1234-ABCDEF
-    const parts = ref.split("-");
-    const providerSlug = (parts[1]?.toLowerCase() ?? "") as PaymentProviderSlug;
+    // Unified reference format: NP-<PROVIDER>-<userId>-<ts>[-rand] (P0-4)
+    const parsed = parsePaymentReference(ref);
+    const providerSlug = parsed?.provider as PaymentProviderSlug | undefined;
 
-    if (!providerSlug || !["paystack", "flutterwave", "interswitch"].includes(providerSlug)) {
-      console.warn(`[Reconcile] Unknown provider in reference: ${ref}`);
+    if (!providerSlug) {
+      console.warn(`[Reconcile] Unparseable payment reference: ${ref}`);
       result.skipped++;
       continue;
     }
@@ -156,25 +157,9 @@ export async function reconcile(): Promise<ReconciliationResult> {
       const provider = getProvider(providerSlug);
       const secretKey = getProviderSecretKey(providerSlug);
 
-      let verifyResult;
-      try {
-        verifyResult = await provider.verifyTransaction(ref, secretKey);
-      } catch (verifyErr) {
-        // In demo mode, treat as successful
-        const isDemoKey = secretKey.includes("demo") || secretKey.includes("test_nigerianpass");
-        if (isDemoKey) {
-          verifyResult = {
-            success: true,
-            amountKobo: txn.amountKobo,
-            reference: ref,
-            providerReference: `DEMO-${ref}`,
-            email: "",
-            status: "success" as const,
-          };
-        } else {
-          throw verifyErr;
-        }
-      }
+      // Fail closed (P0-2): a failed provider verification is NEVER treated
+      // as success. There is no demo-mode override.
+      const verifyResult = await provider.verifyTransaction(ref, secretKey);
 
       if (!verifyResult.success || verifyResult.status !== "success") {
         console.log(`[Reconcile] Transaction ${ref} not yet successful (status: ${verifyResult.status}) — skipping`);
@@ -221,22 +206,28 @@ export async function reconcile(): Promise<ReconciliationResult> {
             continue;
           }
 
-          // Credit the wallet
-          const newBalance = userWalletRows[0]!.balanceKobo + verifyResult.amountKobo;
-          await db
-            .update(walletAccounts)
-            .set({ balanceKobo: newBalance, updatedAt: new Date() })
-            .where(eq(walletAccounts.id, userWalletRows[0]!.id));
-
-          // Update the transaction to mark it completed
-          await db
-            .update(walletTransactions)
-            .set({
-              walletId: userWalletRows[0]!.id,
-              balanceAfterKobo: newBalance,
-              description: txn.description?.replace("(pending)", "(reconciled)") ?? "Wallet top-up (reconciled)",
-            })
-            .where(eq(walletTransactions.id, txn.id));
+          // Credit the wallet atomically (P0-4): SQL-side increment inside a
+          // transaction — no read-modify-write balance math in JS.
+          const newBalance = await db.transaction(async (tx) => {
+            const upd = await tx
+              .update(walletAccounts)
+              .set({
+                balanceKobo: sql`${walletAccounts.balanceKobo} + ${verifyResult.amountKobo}`,
+                updatedAt: new Date(),
+              })
+              .where(eq(walletAccounts.id, userWalletRows[0]!.id))
+              .returning({ balanceKobo: walletAccounts.balanceKobo });
+            const nb = upd[0]?.balanceKobo ?? 0;
+            await tx
+              .update(walletTransactions)
+              .set({
+                walletId: userWalletRows[0]!.id,
+                balanceAfterKobo: nb,
+                description: txn.description?.replace("(pending)", "(reconciled)") ?? "Wallet top-up (reconciled)",
+              })
+              .where(eq(walletTransactions.id, txn.id));
+            return nb;
+          });
 
           // Emit WebSocket event
           const emitter = getKycStatusEmitter();
@@ -271,23 +262,27 @@ export async function reconcile(): Promise<ReconciliationResult> {
         continue;
       }
 
-      // ── 5. Credit the wallet ───────────────────────────────────────────────
+      // ── 5. Credit the wallet atomically (P0-4) ─────────────────────────────
       const wallet = walletRows[0]!;
-      const newBalance = wallet.balanceKobo + verifyResult.amountKobo;
-
-      await db
-        .update(walletAccounts)
-        .set({ balanceKobo: newBalance, updatedAt: new Date() })
-        .where(eq(walletAccounts.id, wallet.id));
-
-      // Update the transaction record
-      await db
-        .update(walletTransactions)
-        .set({
-          balanceAfterKobo: newBalance,
-          description: txn.description?.replace("(pending)", "(reconciled)") ?? "Wallet top-up (reconciled)",
-        })
-        .where(eq(walletTransactions.id, txn.id));
+      const newBalance = await db.transaction(async (tx) => {
+        const upd = await tx
+          .update(walletAccounts)
+          .set({
+            balanceKobo: sql`${walletAccounts.balanceKobo} + ${verifyResult.amountKobo}`,
+            updatedAt: new Date(),
+          })
+          .where(eq(walletAccounts.id, wallet.id))
+          .returning({ balanceKobo: walletAccounts.balanceKobo });
+        const nb = upd[0]?.balanceKobo ?? 0;
+        await tx
+          .update(walletTransactions)
+          .set({
+            balanceAfterKobo: nb,
+            description: txn.description?.replace("(pending)", "(reconciled)") ?? "Wallet top-up (reconciled)",
+          })
+          .where(eq(walletTransactions.id, txn.id));
+        return nb;
+      });
 
       // Emit WebSocket event to notify the user's wallet page
       const emitter = getKycStatusEmitter();

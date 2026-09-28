@@ -6,7 +6,7 @@ import {
   FileText, Settings, RefreshCw, BarChart3, Users, Wifi, Package, ScanLine, Radio, History, Phone
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useAuth } from "@/contexts/AuthContext";
+import { useAuth } from "@/_core/hooks/useAuth";
 import { getLoginUrl } from "@/const";
 
 const NAV_ITEMS = [
@@ -88,10 +88,9 @@ export default function PortalLayout({ children, title, subtitle }: PortalLayout
 
   const currentItem = NAV_ITEMS.flatMap(g => g.items).find(i => location.startsWith(i.href));
 
-  const userInitials = user?.phone
-    ? user.phone.slice(-4)
-    : user?.user_id
-    ? user.user_id.slice(0, 2).toUpperCase()
+  const displayName = user?.name ?? user?.email ?? "";
+  const userInitials = displayName
+    ? displayName.replace(/\D/g, "").slice(-4) || displayName.slice(0, 2).toUpperCase()
     : "?";
 
   return (
@@ -169,7 +168,7 @@ export default function PortalLayout({ children, title, subtitle }: PortalLayout
                 {userInitials}
               </div>
               <div className="flex-1 min-w-0">
-                <div className="text-xs font-medium text-white/80 truncate">{user.phone ?? user.user_id}</div>
+                <div className="text-xs font-medium text-white/80 truncate">{displayName || "Signed in"}</div>
                 <div className="text-[10px] text-white/40 truncate capitalize">{user.role ?? "user"}</div>
               </div>
             </div>

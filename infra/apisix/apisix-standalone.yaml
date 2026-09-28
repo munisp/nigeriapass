@@ -1,0 +1,69 @@
+# APISIX standalone route table (conf/apisix.yaml).
+# Source of truth for humans is infra/apisix-routes.json; this file is the
+# rendered data-plane config. Regenerate/apply with:
+#   tsx server/integrations/apisix.ts (or import syncApisixRoutes() from a job)
+routes:
+  - id: api-trpc
+    uris:
+      - /api/trpc/*
+    upstream_id: app
+    plugins:
+      limit-req:
+        rate: 20
+        burst: 40
+        rejected_code: 429
+        key_type: var
+        key: remote_addr
+      prometheus: {}
+
+  - id: api-webhooks
+    uris:
+      - /api/webhooks/*
+    upstream_id: app
+    plugins:
+      # Webhooks must not be rate-limited by caller IP (provider egress IPs
+      # are shared); authenticity is by signature in server/payments.
+      ip-restriction:
+        whitelist:
+          - 0.0.0.0/0
+      prometheus: {}
+
+  - id: ussd-callback
+    uris:
+      - /api/ussd/*
+    upstream_id: app
+    plugins:
+      limit-count:
+        count: 500
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+
+  - id: pwa-static
+    uris:
+      - /*
+    upstream_id: app
+    priority: -10   # catch-all, lowest priority
+
+upstreams:
+  - id: app
+    type: roundrobin
+    retries: 1
+    timeout:
+      connect: 5
+      send: 30
+      read: 60
+    nodes:
+      - host: host.docker.internal   # app runs outside compose in dev
+        port: 3000
+        weight: 1
+    checks:
+      active:
+        http_path: /healthz
+        healthy:
+          interval: 10
+          successes: 2
+        unhealthy:
+          interval: 5
+          http_failures: 3
+#END

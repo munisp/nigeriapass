@@ -1,0 +1,38 @@
+# APISIX standalone-mode config (mounted into the apisix container).
+# Routes live in apisix-standalone.yaml (data plane, loaded from file) and are
+# kept in sync from the declarative manifest infra/apisix-routes.json via
+# server/integrations/apisix.ts when the admin API is enabled.
+apisix:
+  node_listen: 9080
+  enable_admin: true
+  allow_admin:
+    - 0.0.0.0/0            # DEV ONLY — restrict to the app subnet in production
+  admin_key:
+    - name: admin
+      key: ${APISIX_ADMIN_KEY:-edd1c9f034335f136f87ad84b625c8f1}  # CHANGE ME
+      role: admin
+deployment:
+  role: data_plane
+  role_data_plane:
+    config_provider: yaml  # standalone: reads conf/apisix.yaml
+  admin:
+    admin_listen:
+      ip: 0.0.0.0
+      port: 9180
+plugins:
+  - limit-count
+  - limit-req
+  - cors
+  - prometheus
+  - proxy-rewrite
+  - response-rewrite
+  - request-validation
+  - openid-connect
+  - ip-restriction
+  # openappsec: requires the agent attachment (see compose openappsec-agent
+  # service + docs/INFRA.md). Listed here so routes can reference it once the
+  # agent layer is baked into the image.
+  - openappsec
+plugin_attrs:
+  prometheus:
+    export_uri: /apisix/prometheus/metrics

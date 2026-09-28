@@ -1,11 +1,24 @@
 /**
  * NigerianPass Real-time Notification Hook
- * Connects to the WebSocket notifications stream and maintains a local notification store.
- * Falls back to polling every 30s if WebSocket is unavailable.
+ * =========================================
+ * Connects to the server WebSocket endpoint at /ws/kyc and converts server
+ * events into notification entries:
+ *
+ *   - kyc_status_changed → KYC/KYB review notifications
+ *   - wallet_credited    → wallet credit alerts
+ *   - tier_upgraded      → wallet tier upgrade alerts
+ *
+ * Events are routed server-side to the authenticated user's userId, so this
+ * hook subscribes with the current user's ID (from trpc.auth.me).
+ *
+ * There is no demo seed data and no polling of nonexistent REST endpoints:
+ * before sign-in (or when the socket is down) the store is simply empty and
+ * isConnected=false. Read state is tracked locally (server-side persistence
+ * of read receipts is not yet available).
  */
 import { useState, useEffect, useRef, useCallback } from "react";
-import { notificationApi, type AppNotification, WS_BASE } from "@/lib/api";
-import { tokenStore } from "@/lib/api";
+import { trpc } from "@/lib/trpc";
+import { type AppNotification } from "@/lib/api";
 
 interface NotificationState {
   notifications: AppNotification[];
@@ -20,117 +33,100 @@ interface UseNotificationsReturn extends NotificationState {
   refresh: () => void;
 }
 
-// Simulate demo notifications when no backend is available
-const DEMO_NOTIFICATIONS: AppNotification[] = [
-  {
-    id: "n1",
-    type: "kyc_review",
-    title: "KYC Under Review",
-    message: "Your driver KYC application DRV-XKQP7 is being reviewed by our team.",
-    read: false,
-    reference: "DRV-XKQP7",
-    created_at: new Date(Date.now() - 1000 * 60 * 5).toISOString(),
-  },
-  {
-    id: "n2",
-    type: "vehicle_approved",
-    title: "Vehicle Registered",
-    message: "Vehicle ABC-123-XY has been successfully registered and is toll-ready.",
-    read: false,
-    reference: "VEH-M3NR2",
-    created_at: new Date(Date.now() - 1000 * 60 * 30).toISOString(),
-  },
-  {
-    id: "n3",
-    type: "toll_charge",
-    title: "Toll Charged",
-    message: "₦350 deducted at Lagos-Ibadan Expressway (Sagamu Interchange). Balance: ₦4,650.",
-    read: true,
-    reference: "TXN-8823",
-    created_at: new Date(Date.now() - 1000 * 60 * 60 * 2).toISOString(),
-  },
-  {
-    id: "n4",
-    type: "low_balance",
-    title: "Low Wallet Balance",
-    message: "Your NigerianPass wallet balance is below ₦1,000. Top up to avoid disruption.",
-    read: true,
-    created_at: new Date(Date.now() - 1000 * 60 * 60 * 5).toISOString(),
-  },
-  {
-    id: "n5",
-    type: "kyc_approved",
-    title: "KYC Approved",
-    message: "Congratulations! Your identity has been verified. You can now register vehicles.",
-    read: true,
-    reference: "DRV-PREV1",
-    created_at: new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString(),
-  },
-];
+const MAX_RECONNECT = 5;
+
+let notifSeq = 0;
+const nextId = () => `ws-${Date.now()}-${notifSeq++}`;
+
+function wsUrl(): string {
+  const proto = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${proto}://${window.location.host}/ws/kyc`;
+}
 
 export function useNotifications(): UseNotificationsReturn {
   const [state, setState] = useState<NotificationState>({
-    notifications: DEMO_NOTIFICATIONS,
-    unreadCount: DEMO_NOTIFICATIONS.filter(n => !n.read).length,
+    notifications: [],
+    unreadCount: 0,
     isConnected: false,
     lastUpdate: null,
   });
 
+  // Current user — needed so the server can route user-targeted events to us
+  const meQuery = trpc.auth.me.useQuery(undefined, {
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
+  const userId = typeof meQuery.data?.id === "number" ? meQuery.data.id : null;
+
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const reconnectAttempts = useRef(0);
-  const MAX_RECONNECT = 5;
 
-  // ── Fetch from API (polling fallback) ──────────────────────────────────────
-  const fetchNotifications = useCallback(async () => {
-    const token = tokenStore.get();
-    if (!token) return; // not authenticated
-    try {
-      const data = await notificationApi.list({ limit: 50 });
-      setState(prev => ({
-        ...prev,
-        notifications: data.notifications,
-        unreadCount: data.unread_count,
-        lastUpdate: new Date(),
-      }));
-    } catch {
-      // Backend unavailable — keep demo data
-    }
+  const pushNotification = useCallback((n: AppNotification) => {
+    setState(prev => ({
+      ...prev,
+      notifications: [n, ...prev.notifications].slice(0, 100),
+      unreadCount: prev.unreadCount + 1,
+      lastUpdate: new Date(),
+    }));
   }, []);
 
   // ── WebSocket connection ───────────────────────────────────────────────────
   const connectWS = useCallback(() => {
-    const token = tokenStore.get();
-    if (!token) return;
+    if (userId === null) return; // not signed in — nothing to subscribe to
 
     try {
-      const url = `${WS_BASE}/notifications?token=${encodeURIComponent(token)}`;
-      const ws = new WebSocket(url);
+      const ws = new WebSocket(wsUrl());
       wsRef.current = ws;
 
       ws.onopen = () => {
         reconnectAttempts.current = 0;
         setState(prev => ({ ...prev, isConnected: true }));
-        // Stop polling once WS is connected
-        if (pollTimer.current) {
-          clearInterval(pollTimer.current);
-          pollTimer.current = null;
-        }
+        // Register our userId so the server routes user-targeted events here.
+        // ("__self__" is a placeholder referenceId — routing is by userId.)
+        ws.send(JSON.stringify({ type: "subscribe", referenceId: "__self__", userId }));
       };
 
       ws.onmessage = (evt) => {
         try {
-          const msg = JSON.parse(evt.data) as { type: string; notification?: AppNotification; unread_count?: number };
-          if (msg.type === "notification" && msg.notification) {
-            setState(prev => ({
-              ...prev,
-              notifications: [msg.notification!, ...prev.notifications].slice(0, 100),
-              unreadCount: msg.unread_count ?? prev.unreadCount + 1,
-              lastUpdate: new Date(),
-            }));
-          } else if (msg.type === "ping") {
+          const msg = JSON.parse(evt.data) as Record<string, unknown>;
+          if (msg.type === "ping") {
             ws.send(JSON.stringify({ type: "pong" }));
+            return;
+          }
+
+          if (msg.type === "kyc_status_changed") {
+            const status = msg.newStatus as string;
+            const referenceId = msg.referenceId as string;
+            const notes = (msg.reviewNotes as string | null) ?? undefined;
+            const base = { id: nextId(), read: false, reference: referenceId, created_at: new Date().toISOString() };
+            if (status === "approved") {
+              pushNotification({ ...base, type: "kyc_approved", title: "Application Approved", message: notes ?? `Application ${referenceId} has been approved.` });
+            } else if (status === "rejected" || status === "requires_resubmission") {
+              pushNotification({ ...base, type: "kyc_rejected", title: status === "rejected" ? "Application Rejected" : "Resubmission Required", message: notes ?? `Application ${referenceId} needs attention.` });
+            } else {
+              pushNotification({ ...base, type: "kyc_review", title: "Application Update", message: notes ?? `Application ${referenceId} is now ${status.replace(/_/g, " ")}.` });
+            }
+          } else if (msg.type === "wallet_credited") {
+            const amount = ((msg.amountKobo as number) / 100).toLocaleString("en-NG", { minimumFractionDigits: 2 });
+            pushNotification({
+              id: nextId(),
+              type: "system",
+              title: "Wallet Credited",
+              message: `₦${amount} was credited to your wallet (ref: ${msg.reference}).`,
+              read: false,
+              reference: msg.reference as string,
+              created_at: new Date().toISOString(),
+            });
+          } else if (msg.type === "tier_upgraded") {
+            pushNotification({
+              id: nextId(),
+              type: "system",
+              title: "Wallet Tier Upgraded",
+              message: `Your wallet was upgraded from ${msg.oldTier} to ${msg.newTier}.`,
+              read: false,
+              created_at: new Date().toISOString(),
+            });
           }
         } catch { /* ignore malformed */ }
       };
@@ -138,49 +134,38 @@ export function useNotifications(): UseNotificationsReturn {
       ws.onclose = () => {
         setState(prev => ({ ...prev, isConnected: false }));
         wsRef.current = null;
-        // Exponential back-off reconnect
         if (reconnectAttempts.current < MAX_RECONNECT) {
           const delay = Math.min(1000 * 2 ** reconnectAttempts.current, 30_000);
           reconnectAttempts.current++;
           reconnectTimer.current = setTimeout(connectWS, delay);
-        } else {
-          // Fall back to polling
-          startPolling();
         }
+        // After MAX_RECONNECT attempts, stay disconnected (honest empty state)
       };
 
       ws.onerror = () => {
         ws.close();
       };
     } catch {
-      startPolling();
+      setState(prev => ({ ...prev, isConnected: false }));
     }
-  }, [fetchNotifications]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [userId, pushNotification]);
 
-  const startPolling = useCallback(() => {
-    if (pollTimer.current) return;
-    fetchNotifications();
-    pollTimer.current = setInterval(fetchNotifications, 30_000);
-  }, [fetchNotifications]);
-
-  // ── Mount / unmount ────────────────────────────────────────────────────────
+  // ── Mount / unmount / re-auth ──────────────────────────────────────────────
   useEffect(() => {
     connectWS();
     return () => {
       if (wsRef.current) wsRef.current.close();
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
-      if (pollTimer.current) clearInterval(pollTimer.current);
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [connectWS]);
 
-  // ── Actions ────────────────────────────────────────────────────────────────
+  // ── Actions (local read state — no server read-receipt endpoint yet) ──────
   const markRead = useCallback(async (id: string) => {
     setState(prev => ({
       ...prev,
       notifications: prev.notifications.map(n => n.id === id ? { ...n, read: true } : n),
       unreadCount: Math.max(0, prev.unreadCount - 1),
     }));
-    try { await notificationApi.markRead(id); } catch { /* optimistic update — ignore */ }
   }, []);
 
   const markAllRead = useCallback(async () => {
@@ -189,12 +174,15 @@ export function useNotifications(): UseNotificationsReturn {
       notifications: prev.notifications.map(n => ({ ...n, read: true })),
       unreadCount: 0,
     }));
-    try { await notificationApi.markAllRead(); } catch { /* optimistic update — ignore */ }
   }, []);
 
   const refresh = useCallback(() => {
-    fetchNotifications();
-  }, [fetchNotifications]);
+    // No REST history endpoint — reconnect the socket if it dropped
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      reconnectAttempts.current = 0;
+      connectWS();
+    }
+  }, [connectWS]);
 
   return { ...state, markRead, markAllRead, refresh };
 }

@@ -1,0 +1,10 @@
+{
+  "ts": 1790593570,
+  "kind": "feature_drift",
+  "model": "fraud",
+  "drifted": [
+    "ip_degree",
+    "kyc_tier"
+  ],
+  "n_drifted": 2
+}

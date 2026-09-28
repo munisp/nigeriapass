@@ -18,6 +18,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { Server } from "http";
 import { getKycStatusEmitter, type KycStatusChangedEvent, type WalletCreditedEvent, type TierUpgradedEvent } from "./events/kycEvents";
 import { notifyOwner } from "./_core/notification";
+import { sdk } from "./_core/sdk";
 
 interface ConnectedClient {
   ws: WebSocket;
@@ -57,11 +58,25 @@ export function setupWebSocketServer(httpServer: Server): WebSocketServer {
     }).catch(e => console.warn("[WS] Failed to notify owner of wallet credit:", e));
   });
 
-  wss.on("connection", (ws: WebSocket, req: import("http").IncomingMessage) => {
+  wss.on("connection", async (ws: WebSocket, req: import("http").IncomingMessage) => {
     const clientId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    // ── Authenticate the upgrade request (audit v13, P0-9) ──────────────────
+    // The session JWT cookie is validated server-side; userId is derived from
+    // the authenticated user — client-supplied userId claims are ignored.
+    let authedUserId: number | null = null;
+    try {
+      const user = await sdk.authenticateRequest(req as unknown as import("express").Request);
+      authedUserId = user.id;
+    } catch {
+      // Unauthenticated sockets may still subscribe to referenceId channels
+      // (public status page) but NEVER receive user-targeted events.
+      authedUserId = null;
+    }
+
     const client: ConnectedClient = {
       ws,
-      userId: null,
+      userId: authedUserId,
       subscriptions: new Set(),
       lastPing: Date.now(),
     };
@@ -119,10 +134,9 @@ function handleClientMessage(
       const refId = msg.referenceId as string;
       if (refId) {
         client.subscriptions.add(refId);
-        if (msg.userId && typeof msg.userId === "number") {
-          client.userId = msg.userId;
-        }
-        sendToClient(client.ws, { type: "subscribed", referenceId: refId });
+        // NOTE: userId is set ONLY from the authenticated session at upgrade
+        // time (P0-9) — client-supplied userId values are never trusted.
+        sendToClient(client.ws, { type: "subscribed", referenceId: refId, authenticated: client.userId !== null });
         console.log(`[WS] ${clientId} subscribed to ${refId}`);
       }
       break;

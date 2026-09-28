@@ -29,7 +29,11 @@ import { notifyOwner } from "../_core/notification.js";
 // ── HKDF helpers (same as nfc.ts) ─────────────────────────────────────────────
 
 function deriveTagKey(tagId: string): string {
-  const masterSecret = ENV.nfcMasterSecret || "NigerianPass-Server-Master-Secret-v1";
+  // Fail closed — no hardcoded fallback (audit v13, P0-6)
+  const masterSecret = ENV.nfcMasterSecret;
+  if (!masterSecret) {
+    throw new Error("NFC_MASTER_SECRET is not configured. NFC provisioning is disabled.");
+  }
   const ikm = Buffer.from(masterSecret, "utf8");
   const salt = Buffer.from("NigerianPass-NFC-Salt-v1", "utf8");
   const info = Buffer.from(`tag:${tagId}`, "utf8");

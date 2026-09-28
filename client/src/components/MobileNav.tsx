@@ -6,7 +6,7 @@
 import { Link, useLocation } from "wouter";
 import { Home, MapPin, Wallet, Search, Settings } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useAuth } from "@/contexts/AuthContext";
+import { useAuth } from "@/_core/hooks/useAuth";
 
 const NAV_ITEMS = [
   { href: "/", icon: Home, label: "Home" },

@@ -1,0 +1,6 @@
+{"ts": 1790593579, "event": "job_start", "lake": "/mnt/agents/output/nigeriapass-extract/nigerianpass-onboarding-pwa/ml/lakehouse"}
+{"ts": 1790593579, "event": "synthetic_fallback", "reason": "no reachable POSTGRES_URL/DATABASE_URL", "seed": 42}
+{"ts": 1790593583, "event": "reviewer_labels_merged", "new_positive_tx": 39759, "rejected_users": 3954}
+{"ts": 1790593596, "event": "challenger_trained", "version": "v20260928190636", "auc": 0.598448205638904, "metrics": {"auc": 0.598448205638904, "pr_auc": 0.2731750189800699, "f1": 0.25520036019810893, "confusion": {"tn": 66351, "fp": 2475, "fn": 5796, "tp": 1417}, "base_rate": 0.09485921698075987, "val_auc": 0.542750633073404, "train_seconds": 9.0}}
+{"ts": 1790593596, "event": "promotion_decision", "promoted": false, "reason": "challenger auc 0.5984 < champion 0.9960 + 0.001", "challenger": "v20260928190636", "champion": "v1"}
+{"ts": 1790593596, "event": "job_done", "seconds": 17.7, "promoted": false}

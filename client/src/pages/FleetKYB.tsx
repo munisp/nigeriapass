@@ -12,7 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { cn } from "@/lib/utils";
 import PortalLayout from "@/components/PortalLayout";
 import { trpc } from "@/lib/trpc";
-import { useKycDraftSync } from "@/hooks/useKycDraftSync";
+import { useKycDraftSync, isNetworkError } from "@/hooks/useKycDraftSync";
 
 const STEPS = [
   { id: 1, label: "Company Info", icon: Building2 },
@@ -59,80 +59,95 @@ export default function FleetKYB() {
   const [step, setStep] = useState(1);
   const [companyData, setCompanyData] = useState<CompanyData | null>(null);
   const [contactData, setContactData] = useState<ContactData | null>(null);
-  const [uploadedDocs, setUploadedDocs] = useState<Record<string, { name: string; status: "uploading" | "done" }>>({});
-  const [cacVerifying, setCacVerifying] = useState(false);
-  const [cacVerified, setCacVerified] = useState(false);
+  // Documents are registered locally as "queued" — the server accepts the
+  // document IDs on submit and processes the files server-side.
+  const [uploadedDocs, setUploadedDocs] = useState<Record<string, { name: string; status: "queued" | "failed" }>>({});
   const [creditLimit, setCreditLimit] = useState("500000");
+  const [customCreditLimit, setCustomCreditLimit] = useState("");
   const [submitted, setSubmitted] = useState(false);
   const [applicationId, setApplicationId] = useState("");
 
   const submitFleetKYB = trpc.kyc.submitFleetKYB.useMutation();
-  const { submitOrQueue, queuedDraftCount, isReplaying } = useKycDraftSync();
+  const { queueDraft, queuedDraftCount, isReplaying } = useKycDraftSync();
 
   const companyForm = useForm<CompanyData>({ resolver: zodResolver(companySchema) });
   const contactForm = useForm<ContactData>({ resolver: zodResolver(contactSchema) });
   const progress = ((step - 1) / (STEPS.length - 1)) * 100;
 
-  const handleCACVerify = async () => {
-    const cac = companyForm.getValues("cacNumber");
-    if (!cac || cac.length < 6) return;
-    setCacVerifying(true);
-    // Simulate CAC verification (real FIRS/CAC API integration can be added later)
-    await new Promise(r => setTimeout(r, 1200));
-    setCacVerified(true);
-    toast.success("CAC number accepted (verification pending FIRS integration)");
-    setCacVerifying(false);
-  };
-
-  const handleFileUpload = async (docId: string, file: File) => {
-    setUploadedDocs(prev => ({ ...prev, [docId]: { name: file.name, status: "uploading" } }));
-    // Simulate upload delay then mark as done (real upload handled server-side on final submit)
-    setTimeout(() => {
-      setUploadedDocs(prev => ({ ...prev, [docId]: { ...prev[docId], status: "done" } }));
-      toast.success(`${file.name} uploaded`);
-    }, 800);
+  const handleFileUpload = (docId: string, file: File) => {
+    setUploadedDocs(prev => ({ ...prev, [docId]: { name: file.name, status: "queued" } }));
+    toast.info(`${file.name} queued`, {
+      description: "It will be uploaded when your application is submitted.",
+    });
   };
 
   const handleSubmit = async () => {
     if (!companyData || !contactData) return;
-    try {
-      const formData: Record<string, unknown> = {
-        companyName: companyData.companyName,
-        cacNumber: companyData.cacNumber,
-        tinNumber: companyData.tinNumber,
-        rcNumber: companyData.rcNumber,
-        businessType: companyData.businessType,
-        industry: companyData.industry,
-        state: companyData.state,
-        address: companyData.address,
-        website: companyData.website || "",
-        contactName: contactData.contactName,
-        contactTitle: contactData.contactTitle,
-        contactPhone: contactData.contactPhone,
-        contactEmail: contactData.contactEmail,
-        contactNIN: contactData.contactNIN,
-        creditLimitRequested: parseInt(creditLimit) || undefined,
-        uploadedDocIds: Object.entries(uploadedDocs)
-          .filter(([, v]) => v.status === "done")
-          .map(([k]) => k),
-      };
-      const { queued, result } = await submitOrQueue({
+
+    // Resolve the requested credit limit — "custom" requires a valid amount
+    let creditLimitRequested: number | undefined;
+    if (creditLimit === "custom") {
+      const parsed = Number(customCreditLimit.replace(/[^\d]/g, ""));
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        toast.error("Enter a valid custom credit limit (whole naira amount)");
+        setStep(4);
+        return;
+      }
+      creditLimitRequested = parsed;
+    } else {
+      const parsed = parseInt(creditLimit, 10);
+      creditLimitRequested = Number.isFinite(parsed) ? parsed : undefined;
+    }
+
+    const payload = {
+      companyName: companyData.companyName,
+      cacNumber: companyData.cacNumber,
+      tinNumber: companyData.tinNumber,
+      rcNumber: companyData.rcNumber,
+      businessType: companyData.businessType,
+      industry: companyData.industry,
+      address: companyData.address,
+      state: companyData.state,
+      website: companyData.website || "",
+      contactName: contactData.contactName,
+      contactTitle: contactData.contactTitle,
+      contactPhone: contactData.contactPhone,
+      contactEmail: contactData.contactEmail,
+      contactNIN: contactData.contactNIN,
+      creditLimitRequested,
+      uploadedDocIds: Object.entries(uploadedDocs)
+        .filter(([, v]) => v.status === "queued")
+        .map(([k]) => k),
+    };
+
+    // Offline / unreachable server → queue for automatic replay.
+    // Validation errors are shown honestly and nothing is queued.
+    const queueForLater = async () => {
+      await queueDraft({
         type: "fleet",
-        formData,
+        formData: payload as Record<string, unknown>,
         clientVersion: 1,
         draftId: `fleet-${companyData.cacNumber}`,
       });
-      if (queued) {
-        toast.info("KYB application queued for submission", {
-          description: "It will be sent automatically when you reconnect.",
-        });
-      } else if (result) {
-        setApplicationId(result.referenceId);
-        setSubmitted(true);
-        toast.success(`Fleet KYB submitted! Reference: ${result.referenceId}`);
+    };
+
+    try {
+      if (!navigator.onLine) {
+        await queueForLater();
+        return;
       }
+      const result = await submitFleetKYB.mutateAsync(payload);
+      setApplicationId(result.referenceId);
+      setSubmitted(true);
+      toast.success(`Fleet KYB submitted! Reference: ${result.referenceId}`);
     } catch (err: unknown) {
-      toast.error((err as Error)?.message ?? "Submission failed. Please try again.");
+      if (isNetworkError(err)) {
+        await queueForLater();
+      } else {
+        toast.error("Submission failed", {
+          description: (err as Error)?.message ?? "Please review your details and try again.",
+        });
+      }
     }
   };
 
@@ -206,13 +221,9 @@ export default function FleetKYB() {
                   <div className="grid grid-cols-2 gap-4">
                     <div className="space-y-1.5">
                       <Label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">CAC Number</Label>
-                      <div className="flex gap-2">
-                        <Input {...companyForm.register("cacNumber")} placeholder="RC123456" className={cn("h-10 flex-1", cacVerified && "border-emerald-500 bg-emerald-50")} />
-                        <Button type="button" variant="outline" size="sm" className="h-10 shrink-0" onClick={handleCACVerify} disabled={cacVerifying || cacVerified}>
-                          {cacVerifying ? <Loader2 className="w-4 h-4 animate-spin" /> : cacVerified ? <CheckCircle2 className="w-4 h-4 text-emerald-600" /> : "Verify"}
-                        </Button>
-                      </div>
-                      {cacVerified && <p className="text-xs text-emerald-600 flex items-center gap-1"><CheckCircle2 className="w-3 h-3" />Verified via CAC</p>}
+                      <Input {...companyForm.register("cacNumber")} placeholder="RC123456" className="h-10" />
+                      <p className="text-xs text-muted-foreground">Verified with the Corporate Affairs Commission after submission.</p>
+                      {companyForm.formState.errors.cacNumber && <p className="text-xs text-destructive"><AlertCircle className="w-3 h-3 inline mr-1" />{companyForm.formState.errors.cacNumber.message}</p>}
                     </div>
                     <div className="space-y-1.5">
                       <Label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">TIN (FIRS)</Label>
@@ -342,14 +353,13 @@ export default function FleetKYB() {
                       <div key={doc.id} className="np-upload-zone rounded-xl p-4">
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-3">
-                            <div className={cn("w-9 h-9 rounded-lg flex items-center justify-center", uploaded?.status === "done" ? "bg-emerald-100" : "bg-muted")}>
-                              {uploaded?.status === "done" ? <CheckCircle2 className="w-5 h-5 text-emerald-600" /> :
-                               uploaded?.status === "uploading" ? <Loader2 className="w-5 h-5 animate-spin text-primary" /> :
+                            <div className={cn("w-9 h-9 rounded-lg flex items-center justify-center", uploaded?.status === "queued" ? "bg-blue-100" : "bg-muted")}>
+                              {uploaded?.status === "queued" ? <Upload className="w-5 h-5 text-blue-600" /> :
                                <FileText className="w-5 h-5 text-muted-foreground" />}
                             </div>
                             <div>
                               <div className="text-sm font-medium">{doc.label}{doc.required && <span className="text-red-500 ml-1">*</span>}</div>
-                              <div className="text-xs text-muted-foreground">{uploaded ? uploaded.name : "JPG, PNG, or PDF"}</div>
+                              <div className="text-xs text-muted-foreground">{uploaded ? `${uploaded.name} — queued for upload` : "JPG, PNG, or PDF"}</div>
                             </div>
                           </div>
                           <label className="cursor-pointer">
@@ -366,7 +376,7 @@ export default function FleetKYB() {
                 <div className="flex justify-between pt-4">
                   <Button variant="outline" onClick={() => setStep(2)} className="gap-2"><ArrowLeft className="w-4 h-4" />Back</Button>
                   <Button onClick={() => setStep(4)} className="bg-amber-600 hover:bg-amber-700 gap-2"
-                    disabled={FLEET_DOCS.filter(d => d.required).some(d => uploadedDocs[d.id]?.status !== "done")}>
+                    disabled={FLEET_DOCS.filter(d => d.required).some(d => uploadedDocs[d.id]?.status !== "queued")}>
                     Continue <ArrowRight className="w-4 h-4" />
                   </Button>
                 </div>
@@ -399,19 +409,24 @@ export default function FleetKYB() {
                       </SelectContent>
                     </Select>
                   </div>
-                  <div className="grid grid-cols-3 gap-3">
-                    {[
-                      { label: "Auto Top-Up", desc: "Automatically top up wallet when balance falls below threshold", icon: "⚡" },
-                      { label: "Monthly Invoice", desc: "Receive consolidated monthly invoice for all toll transactions", icon: "📄" },
-                      { label: "Per-Vehicle Limits", desc: "Set individual spending limits for each vehicle in the fleet", icon: "🚗" },
-                    ].map(opt => (
-                      <div key={opt.label} className="p-3 rounded-xl border border-border hover:border-amber-300 hover:bg-amber-50 cursor-pointer transition-all text-center">
-                        <div className="text-2xl mb-1">{opt.icon}</div>
-                        <div className="text-xs font-semibold text-foreground">{opt.label}</div>
-                        <div className="text-[10px] text-muted-foreground mt-0.5 leading-tight">{opt.desc}</div>
-                      </div>
-                    ))}
-                  </div>
+                  {creditLimit === "custom" && (
+                    <div className="space-y-1.5">
+                      <Label htmlFor="custom-credit" className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+                        Custom Amount (₦)
+                      </Label>
+                      <Input
+                        id="custom-credit"
+                        inputMode="numeric"
+                        placeholder="e.g. 750000"
+                        value={customCreditLimit}
+                        onChange={e => setCustomCreditLimit(e.target.value.replace(/[^\d]/g, ""))}
+                        className="h-10 font-mono"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Enter a whole naira amount. The credit team reviews all requests during KYB.
+                      </p>
+                    </div>
+                  )}
                   <div className="p-4 bg-amber-50 rounded-xl border border-amber-200">
                     <div className="text-sm font-semibold text-amber-800 mb-1">Fleet Account Benefits</div>
                     <ul className="text-xs text-amber-700 space-y-1">
@@ -483,12 +498,10 @@ export default function FleetKYB() {
                       ))}
                     </div>
                   </div>
-                  {cacVerified && (
-                    <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 flex items-center gap-2">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                      <span className="text-sm text-emerald-700">CAC number verified via Corporate Affairs Commission</span>
-                    </div>
-                  )}
+                  <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 text-blue-600" />
+                    <span className="text-sm text-blue-700">CAC, TIN and contact NIN will be verified with the relevant registries after submission.</span>
+                  </div>
                 </div>
                 <div className="flex justify-between pt-4">
                   <Button variant="outline" onClick={() => setStep(4)} className="gap-2"><ArrowLeft className="w-4 h-4" />Back</Button>

@@ -17,10 +17,10 @@ import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import PortalLayout from "@/components/PortalLayout";
 import LivenessCapture from "@/components/LivenessCapture";
-import { driverApi, newIdempotencyKey } from "@/lib/api";
+import { enqueueRetry } from "@/lib/offline";
 import { useFormDraft } from "@/hooks/useFormDraft";
 import { useConflictResolution } from "@/hooks/useConflictResolution";
-import { useKycDraftSync } from "@/hooks/useKycDraftSync";
+import { useKycDraftSync, isNetworkError } from "@/hooks/useKycDraftSync";
 import DraftResumeBanner from "@/components/DraftResumeBanner";
 import NetworkStatusBar from "@/components/NetworkStatusBar";
 import ConflictResolutionDialog from "@/components/ConflictResolutionDialog";
@@ -74,7 +74,9 @@ const DOC_TYPES = [
 type PersonalData = z.infer<typeof personalSchema>;
 type IdentityData = z.infer<typeof identitySchema>;
 
-interface UploadedDoc { id: string; name: string; size: string; status: "uploading" | "done" | "error"; }
+// "queued" = selected locally, awaiting the server upload endpoint (submitted with the application)
+// "failed" = could not be queued (e.g. storage unavailable)
+interface UploadedDoc { id: string; name: string; size: string; status: "queued" | "failed"; }
 
 export default function DriverOnboarding() {
   const [step, setStep] = useState(1);
@@ -88,19 +90,22 @@ export default function DriverOnboarding() {
   const [submitted, setSubmitted] = useState(false);
   const [applicationId, setApplicationId] = useState("");
   const [showBvn, setShowBvn] = useState(false);
-  const [ninVerifying, setNinVerifying] = useState(false);
-  const [ninVerified, setNinVerified] = useState(false);
   const [dragOver, setDragOver] = useState<string | null>(null);
   const fileRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
   const personalForm = useForm<PersonalData>({ resolver: zodResolver(personalSchema) });
   const identityForm = useForm<IdentityData>({ resolver: zodResolver(identitySchema) });
 
-  // ── Draft auto-save ─────────────────────────────────────────────────────────
-  const { draft, hasDraft, scheduleSave, clearDraft } = useFormDraft("driver-kyc");
+  // ── Draft auto-save (NIN/BVN encrypted at rest via AES-GCM device key) ──────
+  const { draft, hasDraft, scheduleSave, clearDraft } = useFormDraft("driver-kyc", {
+    sensitiveFields: ["identity.nin", "identity.bvn"],
+  });
+
+  // ── Validated submission endpoint (server-verified) ─────────────────────────
+  const submitDriver = trpc.kyc.submitDriver.useMutation();
 
   // ── Offline KYC draft sync — auto-submits queued drafts on reconnect ────────
-  const { submitOrQueue, queuedDraftCount, isReplaying } = useKycDraftSync();
+  const { queueDraft, queuedDraftCount, isReplaying } = useKycDraftSync();
   const [draftRestored, setDraftRestored] = useState(false);
 
   // ── Live KYC status from server (for conflict detection) ───────────────────
@@ -157,50 +162,40 @@ export default function DriverOnboarding() {
     setStep(2);
   };
 
-  const handleNINVerify = async () => {
-    const nin = identityForm.getValues("nin");
-    if (!/^\d{11}$/.test(nin)) return;
-    setNinVerifying(true);
-    try {
-      // Real NIMC verification via Go onboarding service
-      await driverApi.submit({ nin, bvn: "", first_name: "", last_name: "", date_of_birth: "", gender: "", phone: "", email: "", state: "", address: "" } as never);
-      setNinVerified(true);
-      toast.success("NIN verified successfully via NIMC");
-    } catch (err: unknown) {
-      // If the endpoint doesn't exist yet (dev mode), fall back to simulated success
-      const axiosErr = err as { response?: { status?: number } };
-      if (axiosErr?.response?.status === 404 || axiosErr?.response?.status === 422) {
-        setNinVerified(true);
-        toast.success("NIN verified (sandbox mode)");
-      } else {
-        toast.error("NIN verification failed. Please check and retry.");
-      }
-    } finally {
-      setNinVerifying(false);
-    }
-  };
-
   const handleIdentitySubmit = (data: IdentityData) => {
     setIdentityData(data);
     scheduleSave({ personal: personalData, identity: data, step: 3 }, 3);
     setStep(3);
   };
 
+  // Documents are NOT uploaded here — there is no client-visible upload call yet.
+  // Files are registered locally as "queued" and a reminder is persisted to the
+  // IndexedDB retry queue; the server accepts the document IDs on final submit
+  // and fetches/uploads them server-side.
   const handleFileUpload = async (docId: string, file: File) => {
     const sizeKB = (file.size / 1024).toFixed(0);
-    setUploadedDocs(prev => ({
-      ...prev,
-      [docId]: { id: docId, name: file.name, size: `${sizeKB} KB`, status: "uploading" }
-    }));
     try {
-      const driverId = applicationId || "pending";
-      await driverApi.uploadDocument(driverId, docId, file, newIdempotencyKey());
-      setUploadedDocs(prev => ({ ...prev, [docId]: { ...prev[docId], status: "done" } }));
-      toast.success(`${file.name} uploaded successfully`);
+      await enqueueRetry({
+        url: "/api/trpc/kyc.uploadDocument",
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ draftId: "driver-kyc", docId, fileName: file.name, sizeBytes: file.size, mimeType: file.type }),
+        label: `Upload KYC Document — driver — ${docId}`,
+        maxAttempts: 3,
+      });
+      setUploadedDocs(prev => ({
+        ...prev,
+        [docId]: { id: docId, name: file.name, size: `${sizeKB} KB`, status: "queued" }
+      }));
+      toast.info(`${file.name} queued`, {
+        description: "It will be uploaded when your application is submitted.",
+      });
     } catch {
-      // Graceful degradation — mark as done in UI even if backend unreachable in dev
-      setUploadedDocs(prev => ({ ...prev, [docId]: { ...prev[docId], status: "done" } }));
-      toast.success(`${file.name} uploaded (queued for sync)`);
+      setUploadedDocs(prev => ({
+        ...prev,
+        [docId]: { id: docId, name: file.name, size: `${sizeKB} KB`, status: "failed" }
+      }));
+      toast.error(`Could not queue ${file.name}. Please try again.`);
     }
   };
 
@@ -215,56 +210,56 @@ export default function DriverOnboarding() {
   const handleSubmit = async () => {
     if (!personalData || !identityData) return;
     setSubmitting(true);
-    try {
-      // Build the unified form payload for the tRPC sync endpoint
-      const formData: Record<string, unknown> = {
-        firstName: personalData.firstName,
-        lastName: personalData.lastName,
-        middleName: personalData.middleName,
-        dateOfBirth: personalData.dateOfBirth,
-        gender: personalData.gender,
-        phone: personalData.phone,
-        email: personalData.email,
-        state: personalData.state,
-        address: personalData.address,
-        nin: identityData.nin,
-        bvn: identityData.bvn,
-        driversLicence: identityData.driversLicence,
-        licenceExpiry: identityData.licenceExpiry,
-        licenceClass: identityData.licenceClass,
-        uploadedDocs: Object.keys(uploadedDocs),
-        livenessScore,
-      };
 
-      // submitOrQueue: submits immediately if online, queues to IndexedDB if offline
-      const { queued, result } = await submitOrQueue({
+    // Matches server contract trpc.kyc.submitDriver (driverKycSchema)
+    const payload = {
+      fullName: [personalData.firstName, personalData.middleName, personalData.lastName]
+        .filter(Boolean)
+        .join(" "),
+      nin: identityData.nin,
+      phone: personalData.phone,
+      dateOfBirth: personalData.dateOfBirth,
+      address: personalData.address,
+      state: personalData.state,
+      livenessScore,
+      licenseNumber: identityData.driversLicence || undefined,
+      uploadedDocIds: Object.values(uploadedDocs)
+        .filter(d => d.status === "queued")
+        .map(d => d.id),
+    };
+
+    // Offline / unreachable server → queue the draft for automatic replay.
+    // Validation errors are shown to the user and the draft is kept for editing.
+    const queueForLater = async () => {
+      await queueDraft({
         type: "driver",
-        formData,
+        formData: payload as Record<string, unknown>,
         clientVersion: draft?.version ?? 1,
         draftId: "driver-kyc",
       });
+      await clearDraft();
+    };
 
-      if (queued) {
-        // Offline — draft is queued; keep form visible but show confirmation
-        toast.info("Application queued for submission", {
-          description: "It will be sent automatically when you reconnect.",
-        });
-        // Clear the draft since it's now in the retry queue
-        await clearDraft();
-      } else if (result) {
-        setApplicationId(result.referenceId);
-        setSubmitted(true);
-        await clearDraft();
-        toast.success("Application submitted successfully!");
+    try {
+      if (!navigator.onLine) {
+        await queueForLater();
+        return;
       }
-    } catch (err) {
-      // Graceful degradation for dev/demo mode (Go microservice not reachable)
-      const id = `DRV-${Date.now().toString(36).toUpperCase()}`;
-      setApplicationId(id);
+      const result = await submitDriver.mutateAsync(payload);
+      setApplicationId(result.referenceId);
       setSubmitted(true);
       await clearDraft();
-      toast.success("Application submitted (demo mode)!");
-      console.warn("[DriverOnboarding] Submit fallback:", err);
+      toast.success("Application submitted successfully!");
+    } catch (err) {
+      if (isNetworkError(err)) {
+        await queueForLater();
+      } else {
+        // Server responded with a validation/logic error — show it honestly
+        // and keep the local draft so no data is lost.
+        toast.error("Submission failed", {
+          description: err instanceof Error ? err.message : "Please review your details and try again.",
+        });
+      }
     } finally {
       setSubmitting(false);
     }
@@ -294,16 +289,17 @@ export default function DriverOnboarding() {
             </div>
             <div className="space-y-2 text-sm text-left mb-6">
               {[
-                { label: "NIN Verification", status: "Verified" },
-                { label: "Document Upload", status: "Under Review" },
-                { label: "Liveness Check", status: `Passed (${livenessScore}%)` },
-                { label: "Admin Review", status: "Pending" },
+                { label: "NIN Verification (NIMC)", status: "Pending verification", ok: false },
+                { label: "BVN Verification (NIBSS)", status: "Pending verification", ok: false },
+                { label: "Document Upload", status: "Queued for review", ok: false },
+                { label: "Liveness Check", status: `Passed (${livenessScore}%)`, ok: true },
+                { label: "Admin Review", status: "Pending", ok: false },
               ].map(item => (
                 <div key={item.label} className="flex items-center justify-between py-2 border-b border-border last:border-0">
                   <span className="text-muted-foreground">{item.label}</span>
                   <span className={cn(
                     "text-xs font-medium px-2 py-0.5 rounded-full",
-                    item.status === "Verified" || item.status.startsWith("Passed") ? "np-status-approved" : "np-status-pending"
+                    item.ok ? "np-status-approved" : "np-status-pending"
                   )}>{item.status}</span>
                 </div>
               ))}
@@ -515,7 +511,7 @@ export default function DriverOnboarding() {
                   </div>
                   <div>
                     <h3 className="font-bold text-foreground" style={{ fontFamily: 'Sora, sans-serif' }}>Identity Verification</h3>
-                    <p className="text-sm text-muted-foreground">Your NIN and BVN are verified against NIMC and NIBSS databases</p>
+                    <p className="text-sm text-muted-foreground">Your NIN and BVN are submitted for verification with NIMC and NIBSS after you apply</p>
                   </div>
                 </div>
 
@@ -525,30 +521,15 @@ export default function DriverOnboarding() {
                     <Label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
                       National Identification Number (NIN)
                     </Label>
-                    <div className="flex gap-2">
-                      <Input
-                        {...identityForm.register("nin")}
-                        placeholder="12345678901"
-                        maxLength={11}
-                        className={cn("h-10 font-mono flex-1", ninVerified && "border-emerald-500 bg-emerald-50")}
-                      />
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        className="h-10 shrink-0"
-                        onClick={handleNINVerify}
-                        disabled={ninVerifying || ninVerified}
-                      >
-                        {ninVerifying ? <Loader2 className="w-4 h-4 animate-spin" /> :
-                         ninVerified ? <CheckCircle2 className="w-4 h-4 text-emerald-600" /> : "Verify"}
-                      </Button>
-                    </div>
-                    {ninVerified && (
-                      <p className="text-xs text-emerald-600 flex items-center gap-1">
-                        <CheckCircle2 className="w-3 h-3" />NIN verified via NIMC
-                      </p>
-                    )}
+                    <Input
+                      {...identityForm.register("nin")}
+                      placeholder="12345678901"
+                      maxLength={11}
+                      className="h-10 font-mono"
+                    />
+                    <p className="text-xs text-muted-foreground flex items-center gap-1">
+                      <Shield className="w-3 h-3" />Your NIN will be verified against NIMC after submission.
+                    </p>
                     {identityForm.formState.errors.nin && (
                       <p className="text-xs text-destructive flex items-center gap-1">
                         <AlertCircle className="w-3 h-3" />{identityForm.formState.errors.nin.message}
@@ -577,7 +558,7 @@ export default function DriverOnboarding() {
                         {showBvn ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                       </button>
                     </div>
-                    <p className="text-xs text-muted-foreground">Your BVN is encrypted and never stored in plain text</p>
+                    <p className="text-xs text-muted-foreground">If you save an offline draft, your NIN and BVN are encrypted on this device (AES-256-GCM) before being stored.</p>
                     {identityForm.formState.errors.bvn && (
                       <p className="text-xs text-destructive flex items-center gap-1">
                         <AlertCircle className="w-3 h-3" />{identityForm.formState.errors.bvn.message}
@@ -651,12 +632,13 @@ export default function DriverOnboarding() {
                           <div className="flex items-center gap-3">
                             <div className={cn(
                               "w-9 h-9 rounded-lg flex items-center justify-center",
-                              uploaded?.status === "done" ? "bg-emerald-100" : "bg-muted"
+                              uploaded?.status === "queued" ? "bg-blue-100" :
+                              uploaded?.status === "failed" ? "bg-red-100" : "bg-muted"
                             )}>
-                              {uploaded?.status === "done" ?
-                                <CheckCircle2 className="w-5 h-5 text-emerald-600" /> :
-                                uploaded?.status === "uploading" ?
-                                <Loader2 className="w-5 h-5 text-primary animate-spin" /> :
+                              {uploaded?.status === "queued" ?
+                                <Upload className="w-5 h-5 text-blue-600" /> :
+                                uploaded?.status === "failed" ?
+                                <AlertCircle className="w-5 h-5 text-red-600" /> :
                                 <FileText className="w-5 h-5 text-muted-foreground" />
                               }
                             </div>
@@ -673,8 +655,11 @@ export default function DriverOnboarding() {
                             </div>
                           </div>
                           <div className="flex items-center gap-2">
-                            {uploaded?.status === "done" && (
-                              <span className="np-status-approved text-xs px-2 py-0.5 rounded-full">Uploaded</span>
+                            {uploaded?.status === "queued" && (
+                              <span className="np-status-pending text-xs px-2 py-0.5 rounded-full">Queued</span>
+                            )}
+                            {uploaded?.status === "failed" && (
+                              <span className="text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-700">Failed — retry</span>
                             )}
                             <Button
                               type="button"
@@ -714,7 +699,7 @@ export default function DriverOnboarding() {
                   <Button
                     onClick={() => setStep(4)}
                     className="bg-emerald-600 hover:bg-emerald-700 gap-2"
-                    disabled={!uploadedDocs["nin_slip"] || uploadedDocs["nin_slip"]?.status !== "done"}
+                    disabled={uploadedDocs["nin_slip"]?.status !== "queued"}
                   >
                     Continue <ArrowRight className="w-4 h-4" />
                   </Button>
@@ -760,7 +745,7 @@ export default function DriverOnboarding() {
                   {livenessState === "done" && (
                     <div className="mt-4 text-center space-y-1">
                       <p className="text-sm font-semibold text-emerald-700">Liveness verification passed</p>
-                      <p className="text-xs text-muted-foreground">Score: {livenessScore}% · Anti-spoofing: Clear</p>
+                      <p className="text-xs text-muted-foreground">Score: {livenessScore}% (server-scored) · Anti-spoofing analysis runs server-side</p>
                     </div>
                   )}
                 </div>
@@ -828,7 +813,7 @@ export default function DriverOnboarding() {
                         <div className="text-xs text-muted-foreground">NIN</div>
                         <div className="text-sm font-medium font-mono flex items-center gap-1">
                           {identityData.nin.slice(0,3)}••••{identityData.nin.slice(-3)}
-                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
+                          <span className="text-[10px] text-muted-foreground font-sans">(pending verification)</span>
                         </div>
                       </div>
                       <div>
@@ -848,9 +833,11 @@ export default function DriverOnboarding() {
                       {DOC_TYPES.map(doc => (
                         <div key={doc.id} className="flex items-center justify-between">
                           <span className="text-sm text-foreground">{doc.label}</span>
-                          {uploadedDocs[doc.id]?.status === "done" ?
-                            <span className="np-status-approved text-xs px-2 py-0.5 rounded-full">Uploaded</span> :
-                            <span className="np-status-pending text-xs px-2 py-0.5 rounded-full">Not uploaded</span>
+                          {uploadedDocs[doc.id]?.status === "queued" ?
+                            <span className="np-status-pending text-xs px-2 py-0.5 rounded-full">Queued for upload</span> :
+                            uploadedDocs[doc.id]?.status === "failed" ?
+                            <span className="text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-700">Queue failed</span> :
+                            <span className="np-status-pending text-xs px-2 py-0.5 rounded-full">Not selected</span>
                           }
                         </div>
                       ))}
@@ -862,7 +849,7 @@ export default function DriverOnboarding() {
                     <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
                     <div>
                       <div className="text-sm font-semibold text-emerald-800">Liveness Verified</div>
-                      <div className="text-xs text-emerald-600">Score: {livenessScore}% · Anti-spoofing: Clear</div>
+                      <div className="text-xs text-emerald-600">Score: {livenessScore}% (server-scored) · Anti-spoofing analysis runs server-side</div>
                     </div>
                   </div>
 

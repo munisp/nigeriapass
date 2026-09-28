@@ -17,7 +17,7 @@
 import { z } from "zod";
 import { publicProcedure, protectedProcedure, router } from "../_core/trpc.js";
 import { TRPCError } from "@trpc/server";
-import { getDb, getOrCreateWalletAccount, getWalletTransactions } from "../db.js";
+import { getDb, getOrCreateWalletAccount, getWalletTransactions, createKycApplication, generateReferenceId } from "../db.js";
 import { ENV } from "../_core/env.js";
 
 // ── USSD session state ────────────────────────────────────────────────────────
@@ -47,7 +47,10 @@ interface UssdSessionState {
   lastActivity: number;
 }
 
-// In-memory session store (TTL 5 minutes — AT sessions are short-lived)
+// Session state lives in the ussd_sessions DB table (state jsonb column) so
+// multi-instance deployments share state (audit v13, P0-10). An in-memory
+// Map is kept as a fast cache and as the fallback when no DB is available
+// (local dev / unit tests).
 const SESSION_TTL_MS = 5 * 60 * 1000;
 const sessionStore = new Map<string, UssdSessionState>();
 
@@ -60,19 +63,86 @@ function cleanExpiredSessions() {
   }
 }
 
-function getOrCreateSession(sessionId: string, phoneNumber: string): UssdSessionState {
-  cleanExpiredSessions();
-  let session = sessionStore.get(sessionId);
-  if (!session) {
-    session = {
-      screen: "main_menu",
-      phoneNumber,
-      createdAt: Date.now(),
-      lastActivity: Date.now(),
-    };
-    sessionStore.set(sessionId, session);
+function serializableState(s: UssdSessionState): Record<string, unknown> {
+  return {
+    screen: s.screen,
+    phoneNumber: s.phoneNumber,
+    userId: s.userId ?? null,
+    topupAmount: s.topupAmount ?? null,
+    vehiclePlate: s.vehiclePlate ?? null,
+    statusRef: s.statusRef ?? null,
+    createdAt: s.createdAt,
+    lastActivity: s.lastActivity,
+  };
+}
+
+function deserializeState(raw: Record<string, unknown>): UssdSessionState {
+  return {
+    screen: (raw.screen as UssdSessionState["screen"]) ?? "main_menu",
+    phoneNumber: String(raw.phoneNumber ?? ""),
+    userId: (raw.userId as string | undefined) ?? undefined,
+    topupAmount: (raw.topupAmount as number | undefined) ?? undefined,
+    vehiclePlate: (raw.vehiclePlate as string | undefined) ?? undefined,
+    statusRef: (raw.statusRef as string | undefined) ?? undefined,
+    createdAt: Number(raw.createdAt ?? Date.now()),
+    lastActivity: Number(raw.lastActivity ?? Date.now()),
+  };
+}
+
+/** Fire-and-forget persist of the live session state into ussd_sessions.state */
+async function persistSessionState(sessionId: string, session: UssdSessionState): Promise<void> {
+  try {
+    const db = await getDb();
+    if (!db) return;
+    const { ussdSessions } = await import("../../drizzle/schema.js");
+    const { eq } = await import("drizzle-orm");
+    await db.update(ussdSessions)
+      .set({ state: serializableState(session), lastActivityAt: new Date() })
+      .where(eq(ussdSessions.sessionId, sessionId));
+  } catch {
+    // Non-fatal — memory cache still holds the state for this instance
   }
-  session.lastActivity = Date.now();
+}
+
+async function getOrCreateSession(sessionId: string, phoneNumber: string): Promise<UssdSessionState> {
+  cleanExpiredSessions();
+  const cached = sessionStore.get(sessionId);
+  if (cached) {
+    cached.lastActivity = Date.now();
+    return cached;
+  }
+
+  // Try to restore from the DB (another instance may own this session)
+  try {
+    const db = await getDb();
+    if (db) {
+      const { ussdSessions } = await import("../../drizzle/schema.js");
+      const { eq } = await import("drizzle-orm");
+      const rows = await db.select({ state: ussdSessions.state })
+        .from(ussdSessions)
+        .where(eq(ussdSessions.sessionId, sessionId))
+        .limit(1);
+      const raw = rows[0]?.state;
+      if (raw && typeof raw === "object") {
+        const restored = deserializeState(raw as Record<string, unknown>);
+        if (Date.now() - restored.lastActivity <= SESSION_TTL_MS) {
+          restored.lastActivity = Date.now();
+          sessionStore.set(sessionId, restored);
+          return restored;
+        }
+      }
+    }
+  } catch {
+    // fall through to fresh session
+  }
+
+  const session: UssdSessionState = {
+    screen: "main_menu",
+    phoneNumber,
+    createdAt: Date.now(),
+    lastActivity: Date.now(),
+  };
+  sessionStore.set(sessionId, session);
   return session;
 }
 
@@ -181,13 +251,15 @@ export async function processUssdInput(
   serviceCode = "*346#",
 ): Promise<string> {
   const wasNew = !sessionStore.has(sessionId);
-  const session = getOrCreateSession(sessionId, phoneNumber);
+  const session = await getOrCreateSession(sessionId, phoneNumber);
   if (userId) session.userId = userId;
 
   // Persist session start (fire-and-forget, only on first interaction)
   if (wasNew) {
     void persistUssdSessionStart(sessionId, phoneNumber, serviceCode, wasNew);
   }
+  // Keep DB session state in sync for multi-instance deployments
+  void persistSessionState(sessionId, session);
 
   // Track interaction count on the in-memory session
   const interactionIndex = ((session as UssdSessionState & { _interactions?: number })._interactions ?? 0) + 1;
@@ -283,15 +355,17 @@ export async function processUssdInput(
     }
     if (depth === 3) {
       if (lastInput === "1" && session.topupAmount) {
-        // In production: initiate payment via Paystack USSD (*737# or similar)
-        // For now: return a payment reference and instructions
-        const ref = `USSD-${Date.now().toString(36).toUpperCase()}`;
+        // INFORMATIONAL ONLY (audit v13, P0-10): no wallet credit happens here.
+        // USSD top-ups must be completed through the payment provider flow
+        // (trpc.wallet.initiateTopup → Paystack/Flutterwave checkout); the
+        // wallet is credited only after a verified provider webhook.
+        const ref = `USSD-INFO-${Date.now().toString(36).toUpperCase()}`;
         return end(
-          `Top-Up Initiated\n\n` +
+          `Top-Up Request (Info)\n\n` +
           `Ref: ${ref}\n` +
           `Amount: ₦${session.topupAmount.toLocaleString()}\n\n` +
-          `Complete payment via\nyour bank's USSD code.\n` +
-          `Credit within 30 mins.`
+          `NO payment has been\ntaken. Complete top-up\nin the app or at\nnigerianpass.ng/wallet.\n` +
+          `Wallet credits only after\nverified payment.`
         );
       }
       return end("Top-up cancelled.\n\nDial *346# to continue.");
@@ -354,13 +428,38 @@ export async function processUssdInput(
     }
     if (depth === 3) {
       if (lastInput === "1" && session.vehiclePlate) {
-        const ref = `VEH-${Date.now().toString(36).toUpperCase()}`;
-        return end(
-          `Vehicle Registered!\n\n` +
-          `Plate: ${session.vehiclePlate}\n` +
-          `Ref: ${ref}\n\n` +
-          `Complete KYC at\nnigerianpass.ng\nfor full activation.`
-        );
+        // Persist a draft vehicle application so the USSD registration is real
+        // and reviewable (audit v13, P0-10). Full KYC still happens in-app.
+        const ref = generateReferenceId("vehicle");
+        try {
+          await createKycApplication({
+            referenceId: ref,
+            userId: session.userId ? parseInt(session.userId, 10) : null,
+            type: "vehicle",
+            status: "draft",
+            formData: {
+              plate_number: session.vehiclePlate,
+              contact_phone: phoneNumber,
+              channel: "ussd",
+              note: "Draft created via USSD — complete KYC in the app for activation.",
+            },
+            fromOfflineQueue: false,
+            clientVersion: 1,
+          });
+          return end(
+            `Vehicle Registered!\n\n` +
+            `Plate: ${session.vehiclePlate}\n` +
+            `Ref: ${ref}\n\n` +
+            `Complete KYC at\nnigerianpass.ng\nfor full activation.`
+          );
+        } catch (err) {
+          console.error("[USSD] Failed to persist vehicle registration:", err);
+          return end(
+            `Registration NOT completed.\n` +
+            `Ref: UNAVAILABLE\n\n` +
+            `Service issue — please\nregister at nigerianpass.ng.`
+          );
+        }
       }
       return end("Registration cancelled.\n\nDial *346# to continue.");
     }
@@ -394,13 +493,16 @@ export async function processUssdInput(
           return end(`No application found\nfor ref: ${ref}\n\nDial *346# to retry.`);
         }
         const app = apps[0];
+        // Keys must match the kyc_status enum exactly (audit v13, P0-10)
         const statusLabel: Record<string, string> = {
-          pending: "Under Review",
+          draft: "Draft (not submitted)",
+          submitted: "Submitted",
+          under_review: "Under Review",
           approved: "Approved",
           rejected: "Rejected",
-          resubmit: "Resubmission Required",
+          requires_resubmission: "Resubmission Required",
         };
-        const label = statusLabel[app.status ?? "pending"] ?? "Unknown";
+        const label = statusLabel[app.status ?? "submitted"] ?? "Unknown";
         const submitted = new Date(app.createdAt ?? Date.now()).toLocaleDateString("en-NG");
         return end(
           `Application Status\n\n` +

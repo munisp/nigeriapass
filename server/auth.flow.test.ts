@@ -124,7 +124,7 @@ describe("auth.logout", () => {
     expect(clearedCookies[0]?.options).toMatchObject({ maxAge: -1 });
   });
 
-  it("uses secure + sameSite=none + httpOnly flags for cross-origin safety", async () => {
+  it("uses secure + sameSite=lax + httpOnly flags for cross-origin safety", async () => {
     const { ctx, clearedCookies } = createAuthContext();
     const caller = appRouter.createCaller(ctx);
 
@@ -132,7 +132,7 @@ describe("auth.logout", () => {
 
     expect(clearedCookies[0]?.options).toMatchObject({
       secure: true,
-      sameSite: "none",
+      sameSite: "lax",
       httpOnly: true,
       path: "/",
     });

@@ -1,0 +1,44 @@
+// Permify schema — NigerianPass ReBAC model.
+// Applied via server/integrations/permify.ts (writeSchema) or:
+//   curl -X POST localhost:3476/v1/tenants/t1/schemas/write ...
+//
+// Why ReBAC: platform roles (admin/operator/...) are global, but fleets own
+// drivers and plazas own devices — a fleet manager must see ONLY their fleet's
+// devices. That relationship is a graph edge, not a role.
+
+entity user {}
+
+entity organization {
+    // organization = fleet (transport union / operator) or toll plaza
+    relation admin @user
+    relation member @user
+
+    action manage = admin
+    action view = admin or member
+}
+
+entity device {
+    // NFC/toll devices belong to a plaza or fleet organization
+    relation parent @organization
+
+    action view = parent.admin or parent.member
+    action provision = parent.admin
+    action revoke = parent.admin
+}
+
+entity application {
+    // KYC applications; assigned to review queues per organization
+    relation parent @organization
+    relation assignee @user
+
+    action review = assignee or parent.admin
+    action view = assignee or parent.member
+}
+
+entity wallet {
+    relation owner @user
+    relation parent @organization   // fleet sub-wallets
+
+    action debit = owner or parent.admin
+    action view = owner or parent.member
+}

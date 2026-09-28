@@ -15,7 +15,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { cn } from "@/lib/utils";
 import PortalLayout from "@/components/PortalLayout";
 import { trpc } from "@/lib/trpc";
-import { useKycDraftSync } from "@/hooks/useKycDraftSync";
+import { useKycDraftSync, isNetworkError } from "@/hooks/useKycDraftSync";
 
 const STEPS = [
   { id: 1, label: "Vehicle Details", icon: Car },
@@ -56,74 +56,74 @@ type VehicleData = z.infer<typeof vehicleSchema>;
 export default function VehicleRegistration() {
   const [step, setStep] = useState(1);
   const [vehicleData, setVehicleData] = useState<VehicleData | null>(null);
-  const [uploadedDocs, setUploadedDocs] = useState<Record<string, { name: string; status: "uploading" | "done" }>>({});
-  const [frscVerifying, setFrscVerifying] = useState(false);
-  const [frscVerified, setFrscVerified] = useState(false);
+  // Documents are registered locally as "queued" — the server accepts the
+  // document IDs on submit and processes the files server-side.
+  const [uploadedDocs, setUploadedDocs] = useState<Record<string, { name: string; status: "queued" | "failed" }>>({});
   const [selectedTollClass, setSelectedTollClass] = useState("");
   const [submitted, setSubmitted] = useState(false);
   const [applicationId, setApplicationId] = useState("");
 
   const registerVehicle = trpc.kyc.registerVehicle.useMutation();
-  const { submitOrQueue, queuedDraftCount, isReplaying } = useKycDraftSync();
+  const { queueDraft, queuedDraftCount, isReplaying } = useKycDraftSync();
 
   const form = useForm<VehicleData>({ resolver: zodResolver(vehicleSchema) });
   const progress = ((step - 1) / (STEPS.length - 1)) * 100;
 
-  const handleFRSCVerify = async () => {
-    const plate = form.getValues("plateNumber");
-    if (!plate || plate.length < 5) return;
-    setFrscVerifying(true);
-    // Simulate FRSC verification (real FRSC API integration can be added later)
-    await new Promise(r => setTimeout(r, 1200));
-    setFrscVerified(true);
-    toast.success("Plate number accepted (verification pending FRSC integration)");
-    setFrscVerifying(false);
-  };
-
-  const handleFileUpload = async (docId: string, file: File) => {
-    setUploadedDocs(prev => ({ ...prev, [docId]: { name: file.name, status: "uploading" } }));
-    // Simulate upload delay then mark as done (real upload handled server-side on final submit)
-    setTimeout(() => {
-      setUploadedDocs(prev => ({ ...prev, [docId]: { ...prev[docId], status: "done" } }));
-      toast.success(`${file.name} uploaded`);
-    }, 800);
+  const handleFileUpload = (docId: string, file: File) => {
+    setUploadedDocs(prev => ({ ...prev, [docId]: { name: file.name, status: "queued" } }));
+    toast.info(`${file.name} queued`, {
+      description: "It will be uploaded when your registration is submitted.",
+    });
   };
 
   const handleSubmit = async () => {
     if (!vehicleData) return;
-    try {
-      const formData: Record<string, unknown> = {
-        plateNumber: vehicleData.plateNumber,
-        make: vehicleData.make,
-        model: vehicleData.model,
-        year: parseInt(vehicleData.year),
-        colour: vehicleData.colour,
-        vehicleType: vehicleData.vehicleType,
-        engineNumber: vehicleData.engineNumber,
-        chassisNumber: vehicleData.chassisNumber,
-        ownerNIN: vehicleData.ownerNIN,
-        tollClass: selectedTollClass || selectedType?.tollClass || "Class 1",
-        uploadedDocIds: Object.entries(uploadedDocs)
-          .filter(([, v]) => v.status === "done")
-          .map(([k]) => k),
-      };
-      const { queued, result } = await submitOrQueue({
+    const payload = {
+      plateNumber: vehicleData.plateNumber.toUpperCase(),
+      make: vehicleData.make,
+      model: vehicleData.model,
+      year: parseInt(vehicleData.year, 10),
+      colour: vehicleData.colour,
+      vehicleType: vehicleData.vehicleType,
+      engineNumber: vehicleData.engineNumber,
+      chassisNumber: vehicleData.chassisNumber,
+      ownerNIN: vehicleData.ownerNIN,
+      tollClass: selectedTollClass
+        ? (VEHICLE_TYPES.find(t => t.value === selectedTollClass)?.tollClass ?? selectedTollClass)
+        : (selectedType?.tollClass || "Class 1"),
+      uploadedDocIds: Object.entries(uploadedDocs)
+        .filter(([, v]) => v.status === "queued")
+        .map(([k]) => k),
+    };
+
+    // Offline / unreachable server → queue for automatic replay.
+    // Validation errors are shown honestly and nothing is queued.
+    const queueForLater = async () => {
+      await queueDraft({
         type: "vehicle",
-        formData,
+        formData: payload as Record<string, unknown>,
         clientVersion: 1,
         draftId: `vehicle-${vehicleData.plateNumber}`,
       });
-      if (queued) {
-        toast.info("Registration queued for submission", {
-          description: "It will be sent automatically when you reconnect.",
-        });
-      } else if (result) {
-        setApplicationId(result.referenceId);
-        setSubmitted(true);
-        toast.success(`Vehicle registered! Reference: ${result.referenceId}`);
+    };
+
+    try {
+      if (!navigator.onLine) {
+        await queueForLater();
+        return;
       }
+      const result = await registerVehicle.mutateAsync(payload);
+      setApplicationId(result.referenceId);
+      setSubmitted(true);
+      toast.success(`Vehicle registered! Reference: ${result.referenceId}`);
     } catch (err: unknown) {
-      toast.error((err as Error)?.message ?? "Submission failed. Please try again.");
+      if (isNetworkError(err)) {
+        await queueForLater();
+      } else {
+        toast.error("Submission failed", {
+          description: (err as Error)?.message ?? "Please review your details and try again.",
+        });
+      }
     }
   };
 
@@ -194,16 +194,13 @@ export default function VehicleRegistration() {
                 </div>
 
                 <form onSubmit={form.handleSubmit(d => { setVehicleData(d); setStep(2); })} className="space-y-4">
-                  {/* Plate number with FRSC verify */}
+                  {/* Plate number — FRSC verification happens server-side after submission */}
                   <div className="space-y-1.5">
                     <Label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Plate Number</Label>
-                    <div className="flex gap-2">
-                      <Input {...form.register("plateNumber")} placeholder="ABC-123-XY" className={cn("h-10 font-mono flex-1 uppercase", frscVerified && "border-emerald-500 bg-emerald-50")} />
-                      <Button type="button" variant="outline" size="sm" className="h-10 shrink-0" onClick={handleFRSCVerify} disabled={frscVerifying || frscVerified}>
-                        {frscVerifying ? <Loader2 className="w-4 h-4 animate-spin" /> : frscVerified ? <CheckCircle2 className="w-4 h-4 text-emerald-600" /> : "Verify FRSC"}
-                      </Button>
-                    </div>
-                    {frscVerified && <p className="text-xs text-emerald-600 flex items-center gap-1"><CheckCircle2 className="w-3 h-3" />Plate verified via FRSC</p>}
+                    <Input {...form.register("plateNumber")} placeholder="ABC-123-XY" className="h-10 font-mono uppercase" />
+                    <p className="text-xs text-muted-foreground flex items-center gap-1">
+                      <Shield className="w-3 h-3" />The plate will be verified with FRSC after submission — status is shown on your application page.
+                    </p>
                     {form.formState.errors.plateNumber && <p className="text-xs text-destructive flex items-center gap-1"><AlertCircle className="w-3 h-3" />{form.formState.errors.plateNumber.message}</p>}
                   </div>
 
@@ -284,14 +281,13 @@ export default function VehicleRegistration() {
                       <div key={doc.id} className="np-upload-zone rounded-xl p-4">
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-3">
-                            <div className={cn("w-9 h-9 rounded-lg flex items-center justify-center", uploaded?.status === "done" ? "bg-emerald-100" : "bg-muted")}>
-                              {uploaded?.status === "done" ? <CheckCircle2 className="w-5 h-5 text-emerald-600" /> :
-                               uploaded?.status === "uploading" ? <Loader2 className="w-5 h-5 animate-spin text-primary" /> :
+                            <div className={cn("w-9 h-9 rounded-lg flex items-center justify-center", uploaded?.status === "queued" ? "bg-blue-100" : "bg-muted")}>
+                              {uploaded?.status === "queued" ? <Upload className="w-5 h-5 text-blue-600" /> :
                                <FileText className="w-5 h-5 text-muted-foreground" />}
                             </div>
                             <div>
                               <div className="text-sm font-medium">{doc.label}{doc.required && <span className="text-red-500 ml-1">*</span>}</div>
-                              <div className="text-xs text-muted-foreground">{uploaded ? uploaded.name : "JPG, PNG, or PDF"}</div>
+                              <div className="text-xs text-muted-foreground">{uploaded ? `${uploaded.name} — queued for upload` : "JPG, PNG, or PDF"}</div>
                             </div>
                           </div>
                           <label className="cursor-pointer">
@@ -308,7 +304,7 @@ export default function VehicleRegistration() {
                 <div className="flex justify-between pt-4">
                   <Button variant="outline" onClick={() => setStep(1)} className="gap-2"><ArrowLeft className="w-4 h-4" />Back</Button>
                   <Button onClick={() => setStep(3)} className="bg-blue-600 hover:bg-blue-700 gap-2"
-                    disabled={VEHICLE_DOCS.filter(d => d.required).some(d => uploadedDocs[d.id]?.status !== "done")}>
+                    disabled={VEHICLE_DOCS.filter(d => d.required).some(d => uploadedDocs[d.id]?.status !== "queued")}>
                     Continue <ArrowRight className="w-4 h-4" />
                   </Button>
                 </div>
@@ -423,9 +419,9 @@ export default function VehicleRegistration() {
                       {VEHICLE_DOCS.map(doc => (
                         <div key={doc.id} className="flex items-center justify-between">
                           <span className="text-sm">{doc.label}</span>
-                          {uploadedDocs[doc.id]?.status === "done" ?
-                            <span className="np-status-approved text-xs px-2 py-0.5 rounded-full">Uploaded</span> :
-                            <span className="np-status-pending text-xs px-2 py-0.5 rounded-full">Skipped</span>}
+                          {uploadedDocs[doc.id]?.status === "queued" ?
+                            <span className="np-status-pending text-xs px-2 py-0.5 rounded-full">Queued for upload</span> :
+                            <span className="np-status-pending text-xs px-2 py-0.5 rounded-full">Not selected</span>}
                         </div>
                       ))}
                     </div>
@@ -441,12 +437,10 @@ export default function VehicleRegistration() {
                     </div>
                   )}
 
-                  {frscVerified && (
-                    <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 flex items-center gap-2">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                      <span className="text-sm text-emerald-700">Plate number verified via FRSC</span>
-                    </div>
-                  )}
+                  <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 flex items-center gap-2">
+                    <Shield className="w-4 h-4 text-blue-600" />
+                    <span className="text-sm text-blue-700">Plate and owner NIN will be verified with FRSC/NIMC after submission.</span>
+                  </div>
                 </div>
 
                 <div className="flex justify-between pt-4">

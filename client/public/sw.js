@@ -1,100 +1,221 @@
 /**
  * NigerianPass Service Worker
- * Strategy: Cache-first for static assets, network-first for API calls
- * Offline fallback: /offline.html for navigation requests
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Caching strategy:
+ *  - Precache: app shell ("/", /offline.html, /manifest.json, icons)
+ *  - Static assets (hashed /assets/*): stale-while-revalidate
+ *  - /api/trpc GET (queries): network-first with 30s cache fallback (TTL 60s)
+ *  - Mutations / webhooks (/api/payments, /api/ussd, POST): network-only
+ *  - Navigations: network-first, offline fallback to cached shell/offline.html
+ *
+ * Cache versioning: bump CACHE_VERSION on every deploy that changes the
+ * precache list or strategy. activate() deletes all caches from older
+ * versions.
+ *
+ * Background sync tags (kept compatible with existing client sync code):
+ *  - "np-retry-queue"     → replay IndexedDB retry_queue mutations
+ *  - "np-balance-refresh" → refresh wallet balance, postMessage BALANCE_REFRESHED
+ *  - "np-kyc-status-sync" → refresh KYC statuses, postMessage KYC_STATUS_SYNCED
+ *  - periodic: "np-periodic-balance", "np-periodic-status"
  */
 
-const CACHE_NAME = "nigerianpass-v1";
-const OFFLINE_URL = "/offline.html";
+const CACHE_VERSION = "v2";
+const PRECACHE = `np-precache-${CACHE_VERSION}`;
+const RUNTIME_STATIC = `np-static-${CACHE_VERSION}`;
+const RUNTIME_API = `np-api-${CACHE_VERSION}`;
+const ACTIVE_CACHES = [PRECACHE, RUNTIME_STATIC, RUNTIME_API];
 
-// Assets to pre-cache on install
+const OFFLINE_URL = "/offline.html";
+/** TTL for cached /api/trpc GET responses (ms). */
+const API_CACHE_TTL_MS = 60 * 1000;
+/** Network timeout before falling back to cache for API GETs (ms). */
+const API_NETWORK_TIMEOUT_MS = 8000;
+/** Cap on runtime cache entries to bound storage on low-end devices. */
+const MAX_STATIC_ENTRIES = 120;
+const MAX_API_ENTRIES = 60;
+
+// App shell — keep this list small; hashed bundles are cached at runtime.
 const PRECACHE_ASSETS = [
   "/",
-  "/offline.html",
+  "/index.html",
+  OFFLINE_URL,
   "/manifest.json",
+  "/icons/icon-192.png",
+  "/icons/icon-512.png",
 ];
 
 // ── Install ───────────────────────────────────────────────────────────────────
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => {
-      return cache.addAll(PRECACHE_ASSETS).catch(() => {
-        // Silently fail if some assets aren't available yet
-      });
-    }).then(() => self.skipWaiting())
+    caches
+      .open(PRECACHE)
+      .then((cache) =>
+        // Cache individually so one missing asset doesn't sink the install.
+        Promise.allSettled(PRECACHE_ASSETS.map((url) => cache.add(url))),
+      )
+      .then(() => self.skipWaiting()),
   );
 });
 
-// ── Activate ──────────────────────────────────────────────────────────────────
+// ── Activate: versioned cleanup + claim ───────────────────────────────────────
 self.addEventListener("activate", (event) => {
   event.waitUntil(
-    caches.keys().then((cacheNames) =>
-      Promise.all(
-        cacheNames
-          .filter((name) => name !== CACHE_NAME)
-          .map((name) => caches.delete(name))
+    caches
+      .keys()
+      .then((names) =>
+        Promise.all(
+          names
+            .filter((name) => name.startsWith("np-") && !ACTIVE_CACHES.includes(name))
+            // Also drop pre-versioning legacy cache names.
+            .concat(names.filter((name) => !name.startsWith("np-")))
+            .map((name) => caches.delete(name)),
+        ),
       )
-    ).then(() => self.clients.claim())
+      .then(() => self.clients.claim()),
   );
 });
 
-// ── Fetch ─────────────────────────────────────────────────────────────────────
+// ── Fetch routing ─────────────────────────────────────────────────────────────
 self.addEventListener("fetch", (event) => {
   const { request } = event;
   const url = new URL(request.url);
 
-  // Skip non-GET and cross-origin requests
+  // Mutations, webhooks, and non-GET traffic: network-only. Never cache
+  // writes — replay is handled by the IndexedDB retry queue + sync tags.
   if (request.method !== "GET") return;
-  if (url.origin !== self.location.origin && !url.hostname.includes("cloudfront.net")) return;
-
-  // API requests: network-first, no cache
-  if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/ws/")) return;
-
-  // Navigation requests: network-first with offline fallback
-  if (request.mode === "navigate") {
-    event.respondWith(
-      fetch(request)
-        .then((response) => {
-          // Cache successful navigation responses
-          if (response.ok) {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
-          }
-          return response;
-        })
-        .catch(async () => {
-          // Offline — serve cached page or offline fallback
-          const cached = await caches.match(request);
-          if (cached) return cached;
-          // SPA fallback: return cached root
-          const root = await caches.match("/");
-          if (root) return root;
-          return caches.match(OFFLINE_URL);
-        })
-    );
+  if (
+    url.pathname.startsWith("/api/payments") ||
+    url.pathname.startsWith("/api/ussd") ||
+    url.pathname.startsWith("/api/oauth") ||
+    url.pathname.startsWith("/ws")
+  ) {
     return;
   }
 
-  // Static assets: cache-first
-  event.respondWith(
-    caches.match(request).then((cached) => {
-      if (cached) return cached;
-      return fetch(request).then((response) => {
-        if (!response.ok) return response;
-        const clone = response.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
-        return response;
-      }).catch(() => caches.match(OFFLINE_URL));
-    })
-  );
+  // Same-origin tRPC queries: network-first with short-TTL cache fallback.
+  if (url.origin === self.location.origin && url.pathname.startsWith("/api/trpc")) {
+    event.respondWith(networkFirstApi(request));
+    return;
+  }
+
+  // Other API paths: network-only (auth state, uploads, etc.).
+  if (url.pathname.startsWith("/api/")) return;
+
+  // Cross-origin: only cache known CDN/font hosts (SWR); ignore the rest.
+  if (url.origin !== self.location.origin) {
+    if (
+      url.hostname.includes("cloudfront.net") ||
+      url.hostname === "fonts.googleapis.com" ||
+      url.hostname === "fonts.gstatic.com"
+    ) {
+      event.respondWith(staleWhileRevalidate(request, RUNTIME_STATIC, MAX_STATIC_ENTRIES));
+    }
+    return;
+  }
+
+  // Navigations: network-first, fall back to cached shell → offline.html.
+  if (request.mode === "navigate") {
+    event.respondWith(navigationHandler(request));
+    return;
+  }
+
+  // Static assets (hashed Vite bundles, icons, images): SWR.
+  event.respondWith(staleWhileRevalidate(request, RUNTIME_STATIC, MAX_STATIC_ENTRIES));
 });
 
-// ── Background Sync ─────────────────────────────────────────────────────────
+// ── Strategies ────────────────────────────────────────────────────────────────
+
+async function navigationHandler(request) {
+  try {
+    const response = await fetch(request);
+    if (response.ok) {
+      const cache = await caches.open(PRECACHE);
+      cache.put(request, response.clone());
+    }
+    return response;
+  } catch {
+    const cached =
+      (await caches.match(request)) ||
+      (await caches.match("/")) ||
+      (await caches.match("/index.html"));
+    return cached || caches.match(OFFLINE_URL);
+  }
+}
+
+async function staleWhileRevalidate(request, cacheName, maxEntries) {
+  const cache = await caches.open(cacheName);
+  const cached = await cache.match(request);
+  const networkPromise = fetch(request)
+    .then(async (response) => {
+      if (response.ok) {
+        await cache.put(request, response.clone());
+        trimCache(cacheName, maxEntries);
+      }
+      return response;
+    })
+    .catch(() => null);
+  // Serve cache immediately if present; otherwise wait for the network.
+  return cached || (await networkPromise) || Response.error();
+}
+
+async function networkFirstApi(request) {
+  const cache = await caches.open(RUNTIME_API);
+  try {
+    const response = await fetchWithTimeout(request, API_NETWORK_TIMEOUT_MS);
+    // Only cache successful, basic (same-origin) responses.
+    if (response.ok) {
+      const headers = new Headers(response.headers);
+      headers.set("sw-cached-at", String(Date.now()));
+      const body = await response.clone().blob();
+      await cache.put(
+        request,
+        new Response(body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+        }),
+      );
+      trimCache(RUNTIME_API, MAX_API_ENTRIES);
+    }
+    return response;
+  } catch {
+    const cached = await cache.match(request);
+    if (cached) {
+      const cachedAt = Number(cached.headers.get("sw-cached-at") || 0);
+      // Honour the TTL for fast paths, but serve stale data when fully
+      // offline — a stale balance beats an error screen in a tunnel.
+      if (Date.now() - cachedAt < API_CACHE_TTL_MS || !navigator.onLine) {
+        return cached;
+      }
+    }
+    return new Response(
+      JSON.stringify({ error: "OFFLINE", message: "You appear to be offline." }),
+      { status: 503, headers: { "Content-Type": "application/json" } },
+    );
+  }
+}
+
+function fetchWithTimeout(request, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(request, { signal: controller.signal }).finally(() => clearTimeout(timer));
+}
+
+/** Evict oldest entries (FIFO by insertion order) beyond the cap. */
+async function trimCache(cacheName, maxEntries) {
+  const cache = await caches.open(cacheName);
+  const keys = await cache.keys();
+  for (let i = 0; i < keys.length - maxEntries; i++) {
+    await cache.delete(keys[i]);
+  }
+}
+
+// ── Background Sync ───────────────────────────────────────────────────────────
 // Fires when the browser decides the device has connectivity.
 // The app registers sync tags via ServiceWorkerRegistration.sync.register().
 self.addEventListener("sync", (event) => {
   if (event.tag === "np-retry-queue") {
-    // Replay all pending offline mutations
+    // Replay all pending offline mutations (incl. the KYC submit queue)
     event.waitUntil(replayRetryQueue());
   } else if (event.tag === "np-balance-refresh") {
     // Refresh wallet balance in background and notify open clients
@@ -148,11 +269,13 @@ async function replayRetryQueue() {
     if (processed > 0) {
       // Notify open windows about the sync result
       const clients = await self.clients.matchAll({ type: "window" });
-      clients.forEach(client => client.postMessage({
-        type: "SYNC_COMPLETE",
-        processed,
-        timestamp: Date.now(),
-      }));
+      clients.forEach((client) =>
+        client.postMessage({
+          type: "SYNC_COMPLETE",
+          processed,
+          timestamp: Date.now(),
+        }),
+      );
     }
   } catch (err) {
     console.error("[SW] replayRetryQueue failed:", err);
@@ -180,11 +303,13 @@ async function refreshWalletBalance() {
 
     // Notify open windows
     const clients = await self.clients.matchAll({ type: "window" });
-    clients.forEach(client => client.postMessage({
-      type: "BALANCE_REFRESHED",
-      balance: data?.result?.data ?? data,
-      timestamp: Date.now(),
-    }));
+    clients.forEach((client) =>
+      client.postMessage({
+        type: "BALANCE_REFRESHED",
+        balance: data?.result?.data ?? data,
+        timestamp: Date.now(),
+      }),
+    );
   } catch (err) {
     console.error("[SW] refreshWalletBalance failed:", err);
   }
@@ -208,11 +333,13 @@ async function syncKycStatuses() {
     });
 
     const clients = await self.clients.matchAll({ type: "window" });
-    clients.forEach(client => client.postMessage({
-      type: "KYC_STATUS_SYNCED",
-      applications: data?.result?.data ?? data,
-      timestamp: Date.now(),
-    }));
+    clients.forEach((client) =>
+      client.postMessage({
+        type: "KYC_STATUS_SYNCED",
+        applications: data?.result?.data ?? data,
+        timestamp: Date.now(),
+      }),
+    );
   } catch (err) {
     console.error("[SW] syncKycStatuses failed:", err);
   }
@@ -279,13 +406,15 @@ self.addEventListener("push", (event) => {
   let data = { title: "NigerianPass", body: "You have a new notification." };
   try {
     if (event.data) data = event.data.json();
-  } catch { /* use defaults */ }
+  } catch {
+    /* use defaults */
+  }
 
   event.waitUntil(
     self.registration.showNotification(data.title || "NigerianPass", {
       body: data.body,
-      icon: "https://d2xsxph8kpxj0f.cloudfront.net/114501028/9uoCntQGmxrFDSX5CAeixb/icon-192_7110dc9d.png",
-      badge: "https://d2xsxph8kpxj0f.cloudfront.net/114501028/9uoCntQGmxrFDSX5CAeixb/icon-72_dd31ccfd.png",
+      icon: "/icons/icon-192.png",
+      badge: "/icons/icon-72.png",
       tag: data.tag || "np-notification",
       data: data.data || {},
       vibrate: [200, 100, 200],
@@ -293,7 +422,7 @@ self.addEventListener("push", (event) => {
         { action: "view", title: "View" },
         { action: "dismiss", title: "Dismiss" },
       ],
-    })
+    }),
   );
 });
 
@@ -304,14 +433,16 @@ self.addEventListener("notificationclick", (event) => {
 
   const url = event.notification.data?.url || "/";
   event.waitUntil(
-    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
-      const existing = clients.find((c) => c.url.includes(self.location.origin));
-      if (existing) {
-        existing.focus();
-        existing.navigate(url);
-      } else {
-        self.clients.openWindow(url);
-      }
-    })
+    self.clients
+      .matchAll({ type: "window", includeUncontrolled: true })
+      .then((clients) => {
+        const existing = clients.find((c) => c.url.includes(self.location.origin));
+        if (existing) {
+          existing.focus();
+          existing.navigate(url);
+        } else {
+          self.clients.openWindow(url);
+        }
+      }),
   );
 });

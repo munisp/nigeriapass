@@ -1,0 +1,512 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NigerianPass — infrastructure integration topology
+#
+# AUDIT TRUTH (AUDIT_REPORT_V12.md): only postgres is real today (grade 3).
+# Everything else below is ABSENT in production (grade 0). This file makes each
+# system one `docker compose --profile <x> up` away — nothing here is required
+# for the app to boot; every server/integrations module degrades gracefully
+# when its env vars are unset.
+#
+# Profiles:
+#   core      postgres, redis, tigerbeetle          ← wallet correctness path
+#   extended  redpanda, keycloak, permify,
+#             opensearch(+dashboards)               ← scale-out eventing & backoffice
+#   edge      apisix, etcd, openappsec              ← API gateway / WAF
+#   graph     neo4j, fluvio                         ← fraud-ring graph, Rust eventing
+#   interop   ml-testing-toolkit                    ← Mojaloop dev simulation ONLY
+#
+# Usage:
+#   docker compose -f infra/docker-compose.infra.yml --profile core up -d
+#   docker compose -f infra/docker-compose.infra.yml --profile core --profile extended up -d
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: nigerianpass-infra
+
+x-default-deploy: &default-deploy
+  resources:
+    limits:
+      cpus: "1.0"
+      memory: 512M
+
+x-restart: &restart-policy
+  restart: unless-stopped
+
+networks:
+  infra:
+    driver: bridge
+
+volumes:
+  pg-data:
+  tb-data:
+  redis-data:
+  redpanda-data:
+  keycloak-data:
+  opensearch-data:
+  neo4j-data:
+  etcd-data:
+  fluvio-data:
+  apisix-shared:
+
+services:
+  # ── POSTGRES (grade 3 — the only real infra today) ──────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["core", "extended", "edge", "graph", "interop"]
+    <<: *restart-policy
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nigerianpass}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-nigerianpass}
+    # Tuned for a 4 vCPU / 8 GB single-node production box. See
+    # infra/postgres/hardening.sql for the in-db checklist and backup.sh for PITR.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - effective_cache_size=6GB
+      - -c
+      - work_mem=16MB            # per sort/hash; ~max_connections*work_mem worst case
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - max_connections=200      # app pool is 20; headroom for pgbouncer later
+      - -c
+      - wal_level=replica        # required for PITR archiving + read replica
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1     # SSD
+      - -c
+      - ssl=${POSTGRES_SSL:-off}  # set POSTGRES_SSL=on after infra/postgres/gen-certs.sh
+      - -c
+      - ssl_cert_file=/var/lib/postgresql/certs/server.crt
+      - -c
+      - ssl_key_file=/var/lib/postgresql/certs/server.key
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - log_min_duration_statement=500  # log queries >500ms
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      # Provide certs before enabling ssl=on in dev:
+      #   openssl req -new -x509 -days 365 -nodes -text \
+      #     -out infra/postgres/certs/server.crt -keyout infra/postgres/certs/server.key \
+      #     -subj "/CN=postgres" && chmod 600 infra/postgres/certs/server.key
+      - ./postgres/certs:/var/lib/postgresql/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 3G
+    networks: [infra]
+
+  # ── TIGERBEETLE (grade 0 — db.ts stores fake string IDs today) ─────────────
+  # Double-entry ledger. Authoritative for wallet balances once enabled;
+  # wallet_accounts.balanceKobo in postgres becomes a read cache.
+  tigerbeetle:
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.16.41
+    profiles: ["core"]
+    <<: *restart-policy
+    # First boot formats the data file (replica 0 of cluster 0), then serves.
+    # For a 3-node replica set see infra/runbooks/tigerbeetle-replication.md.
+    command:
+      - sh
+      - -c
+      - |
+        if [ ! -f /data/cluster_0_replica_0.tigerbeetle ]; then
+          tigerbeetle format --cluster=0 --replica=0 --replica-count=1 \
+            --development /data/cluster_0_replica_0.tigerbeetle;
+        fi
+        exec tigerbeetle start --addresses=0.0.0.0:3000 --development \
+          --cache-grid=256MiB /data/cluster_0_replica_0.tigerbeetle
+    # TB needs io_uring (blocked by default seccomp on Docker >=25) and memlock.
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - "${TIGERBEETLE_PORT:-3000}:3000"
+    volumes:
+      - tb-data:/data
+    healthcheck:
+      # TB has no HTTP probe; a TCP connect to 3000 is the liveness signal.
+      test: ["CMD-SHELL", "nc -z localhost 3000 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    networks: [infra]
+
+  # ── REDIS (grade 0) ─────────────────────────────────────────────────────────
+  # Cache, express-rate-limit store, USSD sessions, WS pub/sub.
+  redis:
+    image: redis:7-alpine
+    profiles: ["core"]
+    <<: *restart-policy
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"                    # AOF: survive restarts (USSD sessions, rate limits)
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - "256mb"
+      - --maxmemory-policy
+      - allkeys-lru              # cache eviction; USSD keys have TTL so safe
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_PASSWORD} --no-auth-warning ping | grep PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 384M
+    networks: [infra]
+
+  # ── REDPANDA (grade 0 — Kafka-compatible, no ZooKeeper/JVM) ────────────────
+  # Single broker for dev/staging. Topics: toll.charges, wallet.events,
+  # kyc.events, audit.events (see server/integrations/kafka.ts).
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    profiles: ["extended"]
+    <<: *restart-policy
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092,OUTSIDE://localhost:19092
+      - --pandaproxy-addr=0.0.0.0:8082
+      - --advertise-pandaproxy-addr=localhost:8082
+    ports:
+      - "${KAFKA_PORT:-19092}:19092"   # host-side kafkajs clients
+      - "8082:8082"                    # REST proxy (debugging)
+      - "9644:9644"                    # admin/metrics
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy.*true' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1536M
+    networks: [infra]
+
+  # ── KEYCLOAK (grade 0) ──────────────────────────────────────────────────────
+  # Backoffice SSO ONLY. Mass-market users stay on phone-OTP (see docs/INFRA.md).
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0
+    profiles: ["extended"]
+    <<: *restart-policy
+    command:
+      - start-dev                                  # dev mode; prod: `start` + TLS + hostname
+      - --import-realm                             # imports /opt/keycloak/data/import/*.json
+      - --db=postgres
+      - --db-url=jdbc:postgresql://postgres:5432/${POSTGRES_DB:-nigerianpass}_keycloak
+      - --db-username=${POSTGRES_USER:-nigerianpass}
+      - --db-password=${POSTGRES_PASSWORD}
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set KEYCLOAK_ADMIN_PASSWORD in .env}
+      KC_HOSTNAME: ${KEYCLOAK_HOSTNAME:-http://localhost:8080}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${KEYCLOAK_PORT:-8080}:8080"
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+      - keycloak-data:/opt/keycloak/data
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\n\r\n' >&3 && grep -q '200' <&3"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    networks: [infra]
+
+  # ── PERMIFY (grade 0) — ReBAC for fleet/plaza delegation ───────────────────
+  permify:
+    image: ghcr.io/permify/permify:v1.2.5
+    profiles: ["extended"]
+    <<: *restart-policy
+    command:
+      - serve
+      - --database-engine=postgres
+      - --database-uri=postgres://${POSTGRES_USER:-nigerianpass}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nigerianpass}_permify?sslmode=disable
+      - --database-max-open-connections=20
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${PERMIFY_PORT:-3476}:3476"   # REST
+      - "3478:3478"                    # gRPC
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3476/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    networks: [infra]
+
+  # ── OPENSEARCH (grade 0) — KYC search + audit logs ─────────────────────────
+  opensearch:
+    image: opensearchproject/opensearch:2.16.0
+    profiles: ["extended"]
+    <<: *restart-policy
+    environment:
+      cluster.name: nigerianpass
+      node.name: os-1
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+      DISABLE_SECURITY_PLUGIN: "true"   # dev only — prod: TLS + internal users
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    ports:
+      - "${OPENSEARCH_PORT:-9200}:9200"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -E 'green|yellow'"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 45s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1280M
+    networks: [infra]
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.16.0
+    profiles: ["extended"]
+    <<: *restart-policy
+    environment:
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    ports:
+      - "5601:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status | grep -q 'overall' || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 12
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    networks: [infra]
+
+  # ── NEO4J (grade 0) — fraud-ring graph mirror ──────────────────────────────
+  neo4j:
+    image: neo4j:5.26-community
+    profiles: ["graph"]
+    <<: *restart-policy
+    environment:
+      NEO4J_AUTH: ${NEO4J_AUTH:-neo4j/neo4j-dev-password-change-me}
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+      NEO4J_dbms_security_procedures_unrestricted: gds.*,apoc.*
+      NEO4JLABS_PLUGINS: '["graph-data-science"]'
+    ports:
+      - "${NEO4J_BOLT_PORT:-7687}:7687"   # bolt
+      - "7474:7474"                       # browser
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    networks: [infra]
+
+  # ── APISIX (grade 0) — edge gateway, standalone mode ───────────────────────
+  apisix:
+    image: apache/apisix:3.10.0-debian
+    profiles: ["edge"]
+    <<: *restart-policy
+    environment:
+      APISIX_STAND_ALONE: "true"       # routes from mounted config, not etcd
+    depends_on:
+      etcd:
+        condition: service_healthy     # etcd kept for future non-standalone mode
+    ports:
+      - "${APISIX_PORT:-9080}:9080"    # data plane
+      - "9180:9180"                    # admin API (server/integrations/apisix.ts)
+      - "9443:9443"                    # TLS data plane
+    volumes:
+      - ./apisix/config.yaml:/usr/local/apisix/conf/config.yaml:ro
+      - ./apisix/apisix-standalone.yaml:/usr/local/apisix/conf/apisix.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9080/apisix/status || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    networks: [infra]
+
+  etcd:
+    image: bitnami/etcd:3.5
+    profiles: ["edge"]
+    <<: *restart-policy
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"  # dev only
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+    ports:
+      - "2379:2379"
+    volumes:
+      - etcd-data:/bitnami/etcd
+    healthcheck:
+      test: ["CMD-SHELL", "etcdctl endpoint health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    deploy: *default-deploy
+    networks: [infra]
+
+  # ── OPENAPPSEC (grade 0) — WAF ──────────────────────────────────────────────
+  # openappsec does NOT run as a plain container here; it attaches as an agent
+  # to the APISIX (or nginx) data plane. This container is only the local
+  # management/agent container — production wiring: install the open-appsec
+  # agent inside the apisix image layer (or sidecar with shared /ext),
+  # enable the `openappsec` plugin per-route (see infra/apisix-routes.json),
+  # and point the agent at this management port or the SaaS portal.
+  openappsec-agent:
+    image: ghcr.io/openappsec/agent:latest
+    profiles: ["edge"]
+    <<: *restart-policy
+    environment:
+      # Token from https://portal.openappsec.io — or run standalone with
+      # local policy only (leave unset => agent enforces local policy file).
+      OPENAPPSEC_TOKEN: ${OPENAPPSEC_TOKEN:-}
+    volumes:
+      - ./openappsec/local_policy.yaml:/etc/cp/conf/local_policy.yaml:ro
+      - apisix-shared:/ext:rw            # shared with apisix sidecar pattern
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /ext/nano_sock || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    deploy: *default-deploy
+    networks: [infra]
+
+  # ── FLUVIO (grade 0) — Rust-native streaming, alternative to Kafka ──────────
+  # Fluvio is cluster-managed (its own SC/SPU processes), not a single
+  # container. This uses the official fluvio CLI image to run a LOCAL
+  # dev cluster (in-cluster SC + one SPU). For staging/prod deploy the
+  # Helm chart onto k8s instead — see docs/INFRA.md "Fluvio".
+  fluvio:
+    image: infinyon/fluvio:stable
+    profiles: ["graph"]
+    <<: *restart-policy
+    command:
+      - sh
+      - -c
+      - |
+        fluvio cluster start --local --spu 1 || fluvio cluster start --local
+        tail -f /dev/null
+    ports:
+      - "${FLUVIO_PORT:-9003}:9003"    # SC
+      - "9011:9011"                    # SPU public
+    volumes:
+      - fluvio-data:/fluvio
+    healthcheck:
+      test: ["CMD-SHELL", "fluvio cluster status | grep -i ok || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 8
+      start_period: 25s
+    deploy: *default-deploy
+    networks: [infra]
+
+  # ── MOJALOOP (grade 0) — DEV SIMULATION ONLY ───────────────────────────────
+  # A full Mojaloop hub is 15+ services (central-ledger, ml-api-adapter,
+  # quoting-service, account-lookup...). For development we run the
+  # ml-testing-toolkit which simulates a counterparty DFSP speaking FSPIOP.
+  # Nigerian reality: domestic interop is NIBSS NIP, not Mojaloop — this is
+  # phase-3 regional/cross-border prep. See server/integrations/mojaloop.ts.
+  mojaloop-ttk:
+    image: mojaloop/ml-testing-toolkit:v17.0.0
+    profiles: ["interop"]
+    <<: *restart-policy
+    environment:
+      CALLBACK_RESOURCES: '{"endpoint":"http://host.docker.internal:3000"}'
+      HUB_ONLY_MODE: "false"
+    ports:
+      - "${MOJALOOP_TTK_PORT:-5050}:5050"   # FSPIOP simulator
+      - "4040:4040"                          # admin UI / API
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4040/api/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    deploy: *default-deploy
+    networks: [infra]

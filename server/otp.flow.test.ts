@@ -17,6 +17,15 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import { TRPCError } from "@trpc/server";
 import type { TrpcContext } from "./_core/context";
 
+// JWT_SECRET must be set BEFORE the env module (./_core/env) is evaluated by
+// the static router imports below — the hardened env no longer provides a
+// fallback cookie secret, and jose refuses to sign with a zero-length key.
+// vi.hoisted runs before any import in this file.
+vi.hoisted(() => {
+  process.env.JWT_SECRET = process.env.JWT_SECRET || "test-jwt-secret-for-otp-flow";
+  process.env.NODE_ENV = "test"; // demo OTP mode is only allowed outside production
+});
+
 // ── Mock the DB layer ─────────────────────────────────────────────────────────
 // We mock the entire db module so the OTP service never needs a live PG instance.
 // vi.hoisted ensures mockDb is available before vi.mock hoisting runs.
@@ -181,7 +190,7 @@ describe("otp.verify — demo mode (code = 123456)", () => {
     expect(cookies[0]?.options).toMatchObject({
       httpOnly: true,
       secure: true,
-      sameSite: "none",
+      sameSite: "lax",
       path: "/",
     });
   });
