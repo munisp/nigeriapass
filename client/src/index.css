@@ -1,0 +1,215 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ============================================================
+   NIGERIANPASS PREMIUM CIVIC DESIGN SYSTEM
+   Movement: Lagos Business District meets Swiss Design System
+   Primary: Navy #1B2B4B | Emerald #059669 | Amber #D97706 | Crimson #DC2626
+   Typography: Sora (headings) + Nunito Sans (body)
+   ============================================================ */
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  /* NigerianPass custom tokens */
+  --color-navy: var(--np-navy);
+  --color-navy-light: var(--np-navy-light);
+  --color-emerald: var(--np-emerald);
+  --color-amber: var(--np-amber);
+  --color-crimson: var(--np-crimson);
+  --color-gold: var(--np-gold);
+}
+
+:root {
+  --radius: 0.5rem;
+  /* NigerianPass palette */
+  --np-navy: oklch(0.28 0.07 255);
+  --np-navy-light: oklch(0.34 0.07 255);
+  --np-emerald: oklch(0.53 0.15 162);
+  --np-amber: oklch(0.65 0.17 60);
+  --np-crimson: oklch(0.55 0.22 25);
+  --np-gold: oklch(0.72 0.14 75);
+
+  /* Semantic colors */
+  --primary: oklch(0.28 0.07 255);
+  --primary-foreground: oklch(0.97 0.005 255);
+  --secondary: oklch(0.95 0.01 255);
+  --secondary-foreground: oklch(0.28 0.07 255);
+  --background: oklch(0.975 0.003 255);
+  --foreground: oklch(0.18 0.04 255);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.18 0.04 255);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.18 0.04 255);
+  --muted: oklch(0.94 0.008 255);
+  --muted-foreground: oklch(0.52 0.03 255);
+  --accent: oklch(0.94 0.008 255);
+  --accent-foreground: oklch(0.28 0.07 255);
+  --destructive: oklch(0.55 0.22 25);
+  --destructive-foreground: oklch(0.97 0 0);
+  --border: oklch(0.88 0.01 255);
+  --input: oklch(0.88 0.01 255);
+  --ring: oklch(0.28 0.07 255);
+  --chart-1: oklch(0.53 0.15 162);
+  --chart-2: oklch(0.65 0.17 60);
+  --chart-3: oklch(0.55 0.22 25);
+  --chart-4: oklch(0.28 0.07 255);
+  --chart-5: oklch(0.72 0.14 75);
+  --sidebar: oklch(0.28 0.07 255);
+  --sidebar-foreground: oklch(0.92 0.01 255);
+  --sidebar-primary: oklch(0.53 0.15 162);
+  --sidebar-primary-foreground: oklch(0.97 0 0);
+  --sidebar-accent: oklch(0.34 0.07 255);
+  --sidebar-accent-foreground: oklch(0.92 0.01 255);
+  --sidebar-border: oklch(0.38 0.06 255);
+  --sidebar-ring: oklch(0.53 0.15 162);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Nunito Sans', sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    font-family: 'Sora', sans-serif;
+    font-weight: 700;
+    line-height: 1.2;
+    letter-spacing: -0.02em;
+  }
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [type="button"]:not(:disabled),
+  [type="submit"]:not(:disabled),
+  a[href] { @apply cursor-pointer; }
+}
+
+@layer components {
+  .container {
+    width: 100%;
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+  .flex { min-height: 0; min-width: 0; }
+
+  @media (min-width: 640px) {
+    .container { padding-left: 1.5rem; padding-right: 1.5rem; }
+  }
+  @media (min-width: 1024px) {
+    .container { padding-left: 2rem; padding-right: 2rem; max-width: 1280px; }
+  }
+
+  /* NigerianPass custom utilities */
+  .np-sidebar {
+    background: linear-gradient(180deg, oklch(0.28 0.07 255) 0%, oklch(0.22 0.08 255) 100%);
+  }
+  .np-glass {
+    background: rgba(255,255,255,0.08);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  .np-glass-dark {
+    background: rgba(27,43,75,0.85);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(255,255,255,0.1);
+  }
+  .np-step-active {
+    background: oklch(0.53 0.15 162);
+    color: white;
+    box-shadow: 0 0 0 4px oklch(0.53 0.15 162 / 0.2);
+  }
+  .np-step-complete {
+    background: oklch(0.53 0.15 162);
+    color: white;
+  }
+  .np-step-pending {
+    background: oklch(0.38 0.06 255);
+    color: oklch(0.65 0.03 255);
+  }
+  .np-status-approved {
+    background: oklch(0.95 0.05 162);
+    color: oklch(0.35 0.12 162);
+    border: 1px solid oklch(0.75 0.1 162);
+  }
+  .np-status-pending {
+    background: oklch(0.97 0.05 60);
+    color: oklch(0.45 0.14 60);
+    border: 1px solid oklch(0.82 0.1 60);
+  }
+  .np-status-rejected {
+    background: oklch(0.97 0.04 25);
+    color: oklch(0.45 0.18 25);
+    border: 1px solid oklch(0.82 0.1 25);
+  }
+  .np-upload-zone {
+    border: 2px dashed oklch(0.75 0.05 255);
+    background: oklch(0.97 0.005 255);
+    transition: all 0.2s ease;
+  }
+  .np-upload-zone:hover, .np-upload-zone.drag-over {
+    border-color: oklch(0.53 0.15 162);
+    background: oklch(0.97 0.03 162);
+  }
+  .np-pulse {
+    animation: np-heartbeat 2s ease-in-out infinite;
+  }
+  @keyframes np-heartbeat {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.7; transform: scale(0.95); }
+  }
+  .np-scan-ring {
+    animation: np-scan 2s linear infinite;
+  }
+  @keyframes np-scan {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+  }
+  .np-progress-bar {
+    background: linear-gradient(90deg, oklch(0.53 0.15 162), oklch(0.65 0.17 162));
+    border-radius: 9999px;
+    transition: width 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+}
